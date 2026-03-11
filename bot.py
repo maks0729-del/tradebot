@@ -20,24 +20,8 @@ TWELVEDATA_BASE = "https://api.twelvedata.com"
 ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 INSTRUMENTS = ["EUR_USD", "GBP_USD", "XAU_USD", "BTC_USD"]
 ALERT_USERS = set()
-SENT_ALERTS = {}  # instrument -> last alert price (deduplication)
-MIN_PRICE_CHANGE_PIPS = 20  # min pips change before resending same setup
-
-
-def is_killzone():
-    """Check if current time is in London or NY killzone."""
-    hour = datetime.now(timezone.utc).hour
-    # London killzone: 08:00-12:00 UTC
-    # New York killzone: 13:00-17:00 UTC
-    return (8 <= hour < 12) or (13 <= hour < 17)
-
-
-def is_asian_session():
-    """Check if current time is Asian session."""
-    hour = datetime.now(timezone.utc).hour
-    return 22 <= hour or hour < 8
-
-
+SENT_ALERTS = {}
+MIN_PRICE_CHANGE_PIPS = 20
 
 SYMBOL_MAP = {
     "EUR_USD": "EUR/USD",
@@ -54,6 +38,16 @@ TIMEFRAMES = {
     "H1":  {"interval": "1h",      "count": 100},
     "M15": {"interval": "15min",   "count": 96},
 }
+
+
+def is_killzone():
+    hour = datetime.now(timezone.utc).hour
+    return (8 <= hour < 12) or (13 <= hour < 17)
+
+
+def is_asian_session():
+    hour = datetime.now(timezone.utc).hour
+    return 22 <= hour or hour < 8
 
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
@@ -140,7 +134,7 @@ def find_swing_highs_lows(candles, lookback=3):
 
 def detect_market_structure(candles):
     if len(candles) < 10:
-        return {"trend": "unknown", "last_bos": None, "last_choch": None}
+        return {"trend": "unknown", "last_bos": None, "last_choch": None, "swing_highs": [], "swing_lows": []}
     swings = find_swing_highs_lows(candles)
     highs = swings["highs"]
     lows = swings["lows"]
@@ -206,19 +200,15 @@ def find_fvg(candles):
         elif nxt["h"] < prev["l"]:
             fvgs.append({"type": "bearish_fvg", "top": prev["l"], "bottom": nxt["h"],
                          "mid": (prev["l"] + nxt["h"]) / 2, "filled": False})
-    # Full fill: price must close BEYOND the entire FVG (not just mid)
     last_low = candles[-1]["l"] if candles else 0
     last_high = candles[-1]["h"] if candles else 0
     last_close = candles[-1]["c"] if candles else 0
     for fvg in fvgs:
         if fvg["type"] == "bullish_fvg":
-            # Full fill: price closed below the bottom of bullish FVG
             if last_close < fvg["bottom"]:
                 fvg["filled"] = True
-            # Partial fill tracker
             fvg["partial"] = last_low < fvg["top"] and last_close > fvg["bottom"]
         elif fvg["type"] == "bearish_fvg":
-            # Full fill: price closed above the top of bearish FVG
             if last_close > fvg["top"]:
                 fvg["filled"] = True
             fvg["partial"] = last_high > fvg["bottom"] and last_close < fvg["top"]
@@ -268,10 +258,7 @@ def get_premium_discount(candles):
             "range_high": high, "range_low": low}
 
 
-
-
 def calculate_fibonacci(candles):
-    """Calculate Fibonacci levels from last significant swing."""
     if len(candles) < 20:
         return {}
     recent = candles[-50:] if len(candles) >= 50 else candles
@@ -282,12 +269,13 @@ def calculate_fibonacci(candles):
         return {}
     return {
         "swing_high": round(swing_high, 5),
-        "swing_low": round(swing_low, 5),
-        "fib_0_5":   round(swing_high - diff * 0.500, 5),
-        "fib_0_618": round(swing_high - diff * 0.618, 5),
-        "fib_0_705": round(swing_high - diff * 0.705, 5),
-        "fib_0_79":  round(swing_high - diff * 0.790, 5),
+        "swing_low":  round(swing_low, 5),
+        "fib_0_5":    round(swing_high - diff * 0.500, 5),
+        "fib_0_618":  round(swing_high - diff * 0.618, 5),
+        "fib_0_705":  round(swing_high - diff * 0.705, 5),
+        "fib_0_79":   round(swing_high - diff * 0.790, 5),
     }
+
 
 def get_key_levels(candles_by_tf):
     levels = {}
@@ -337,20 +325,13 @@ def analyze_smc(candles_by_tf):
         score += 1
     result["setup_quality"] = score
     result["has_setup"] = score >= 3
-
-    # Fibonacci from 1H candles
-    h1_candles = candles_by_tf.get("H1", [])
-    result["fibonacci"] = calculate_fibonacci(h1_candles)
-
+    result["fibonacci"] = calculate_fibonacci(candles_by_tf.get("H1", []))
     return result
-
-
 
 
 # ── CALCULATIONS ──────────────────────────────────────────────────────────────
 
 def pip_value(instrument):
-    """Return pip size for instrument."""
     if "JPY" in instrument:
         return 0.01
     if "XAU" in instrument:
@@ -361,24 +342,21 @@ def pip_value(instrument):
 
 
 def sl_buffer(instrument):
-    """Return minimum SL buffer beyond OB/FVG edge."""
     if "BTC" in instrument:
-        return 150    # $150 buffer for BTC
+        return 150
     if "XAU" in instrument:
-        return 1.5    # $1.5 buffer for Gold
+        return 1.5
     if "JPY" in instrument:
-        return 0.15   # 15 pips for JPY pairs
-    return 0.00100    # 10 pips for forex
+        return 0.15
+    return 0.00100
 
 
 def pips(price_diff, instrument):
-    """Convert price difference to pips."""
     pv = pip_value(instrument)
     return round(abs(price_diff) / pv)
 
 
 def calc_rr(entry, sl, tp):
-    """Calculate Risk:Reward ratio."""
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     if risk == 0:
@@ -387,45 +365,37 @@ def calc_rr(entry, sl, tp):
 
 
 def calculate_setups(instrument, smc_data):
-    """Calculate BUY and SELL setups with SL behind last swing high/low."""
     price = smc_data.get("current_price", 0)
     key = smc_data.get("key_levels", {})
     ob_h1 = smc_data.get("ob_H1", [])
     fvg_h1 = smc_data.get("fvg_H1", [])
     structure_h1 = smc_data.get("structure_H1", {})
     structure_m15 = smc_data.get("structure_M15", {})
-
-    # Get swing highs/lows for SL placement
     swing_highs_h1 = structure_h1.get("swing_highs", [])
     swing_lows_h1 = structure_h1.get("swing_lows", [])
     swing_highs_m15 = structure_m15.get("swing_highs", [])
     swing_lows_m15 = structure_m15.get("swing_lows", [])
-
     buf = sl_buffer(instrument)
     setups = {}
 
     # ── BUY SETUP ──
     buy_obs = [o for o in ob_h1 if o["type"] == "bullish_ob" and o["bottom"] < price]
     buy_fvgs = [f for f in fvg_h1 if f["type"] == "bullish_fvg" and f["bottom"] < price]
-
     buy_entry = None
     buy_sl = None
 
     if buy_obs:
         ob = buy_obs[-1]
-        buy_entry = round(ob["top"], 5)  # Entry at top of bullish OB
-        # SL: behind last swing low on 15M below entry
+        buy_entry = round(ob["top"], 5)
         lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
         if lows_below:
             buy_sl = round(min(lows_below) - buf, 5)
         else:
-            # Fallback: behind OB bottom
             lows_h1_below = [l["price"] for l in swing_lows_h1 if l["price"] < buy_entry]
             if lows_h1_below:
                 buy_sl = round(min(lows_h1_below) - buf, 5)
             else:
                 buy_sl = round(ob["bottom"] - buf, 5)
-
     elif buy_fvgs:
         fvg = buy_fvgs[-1]
         buy_entry = round(fvg["top"], 5)
@@ -437,48 +407,35 @@ def calculate_setups(instrument, smc_data):
 
     if buy_entry and buy_sl:
         risk = abs(buy_entry - buy_sl)
-        # Sanity check — risk must be positive and reasonable
         if risk <= 0:
             risk = buf * 3
             buy_sl = round(buy_entry - risk, 5)
-
         buy_tp1 = round(buy_entry + risk * 2, 5)
         buy_tp2 = round(buy_entry + risk * 3, 5)
-
-        # Use key levels as TP targets if they make sense
         pdh = key.get("PDH")
         pwh = key.get("PWH")
         if pdh and buy_entry < pdh < buy_tp2:
             buy_tp1 = round(pdh, 5)
         if pwh and buy_entry < pwh:
             buy_tp2 = round(pwh, 5)
-
-        rr1 = calc_rr(buy_entry, buy_sl, buy_tp1)
-        rr2 = calc_rr(buy_entry, buy_sl, buy_tp2)
-
         setups["buy"] = {
-            "entry": buy_entry,
-            "sl": buy_sl,
-            "tp1": buy_tp1,
-            "tp2": buy_tp2,
+            "entry": buy_entry, "sl": buy_sl, "tp1": buy_tp1, "tp2": buy_tp2,
             "sl_pips": pips(buy_entry - buy_sl, instrument),
             "tp1_pips": pips(buy_tp1 - buy_entry, instrument),
             "tp2_pips": pips(buy_tp2 - buy_entry, instrument),
-            "rr1": rr1,
-            "rr2": rr2,
+            "rr1": calc_rr(buy_entry, buy_sl, buy_tp1),
+            "rr2": calc_rr(buy_entry, buy_sl, buy_tp2),
         }
 
     # ── SELL SETUP ──
     sell_obs = [o for o in ob_h1 if o["type"] == "bearish_ob" and o["top"] > price]
     sell_fvgs = [f for f in fvg_h1 if f["type"] == "bearish_fvg" and f["top"] > price]
-
     sell_entry = None
     sell_sl = None
 
     if sell_obs:
         ob = sell_obs[0]
-        sell_entry = round(ob["bottom"], 5)  # Entry at bottom of bearish OB
-        # SL: behind last swing high on 15M above entry
+        sell_entry = round(ob["bottom"], 5)
         highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
         if highs_above:
             sell_sl = round(max(highs_above) + buf, 5)
@@ -488,7 +445,6 @@ def calculate_setups(instrument, smc_data):
                 sell_sl = round(max(highs_h1_above) + buf, 5)
             else:
                 sell_sl = round(ob["top"] + buf, 5)
-
     elif sell_fvgs:
         fvg = sell_fvgs[0]
         sell_entry = round(fvg["bottom"], 5)
@@ -503,37 +459,27 @@ def calculate_setups(instrument, smc_data):
         if risk <= 0:
             risk = buf * 3
             sell_sl = round(sell_entry + risk, 5)
-
         sell_tp1 = round(sell_entry - risk * 2, 5)
         sell_tp2 = round(sell_entry - risk * 3, 5)
-
         pdl = key.get("PDL")
         pwl = key.get("PWL")
         if pdl and sell_tp2 < pdl < sell_entry:
             sell_tp1 = round(pdl, 5)
         if pwl and pwl < sell_entry:
             sell_tp2 = round(pwl, 5)
-
-        rr1 = calc_rr(sell_entry, sell_sl, sell_tp1)
-        rr2 = calc_rr(sell_entry, sell_sl, sell_tp2)
-
         setups["sell"] = {
-            "entry": sell_entry,
-            "sl": sell_sl,
-            "tp1": sell_tp1,
-            "tp2": sell_tp2,
+            "entry": sell_entry, "sl": sell_sl, "tp1": sell_tp1, "tp2": sell_tp2,
             "sl_pips": pips(sell_entry - sell_sl, instrument),
             "tp1_pips": pips(sell_entry - sell_tp1, instrument),
             "tp2_pips": pips(sell_entry - sell_tp2, instrument),
-            "rr1": rr1,
-            "rr2": rr2,
+            "rr1": calc_rr(sell_entry, sell_sl, sell_tp1),
+            "rr2": calc_rr(sell_entry, sell_sl, sell_tp2),
         }
 
     return setups
 
 
 def format_setup(setup, direction):
-    """Format setup as readable string for AI prompt."""
     if not setup:
         return "зона не визначена"
     arrow = "BUY" if direction == "buy" else "SELL"
@@ -543,6 +489,7 @@ def format_setup(setup, direction):
         " | TP1: " + "{:.5f}".format(setup["tp1"]) + " (" + str(setup["tp1_pips"]) + " pips, RR 1:" + str(setup["rr1"]) + ")" +
         " | TP2: " + "{:.5f}".format(setup["tp2"]) + " (" + str(setup["tp2_pips"]) + " pips, RR 1:" + str(setup["rr2"]) + ")"
     )
+
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
@@ -597,6 +544,8 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         return labels.get(zone, zone) + " (" + str(pct) + "%, EQ: " + "{:.5f}".format(eq if eq else 0) + ")"
 
     setups = calculate_setups(instrument, smc_data)
+    fib = smc_data.get("fibonacci", {})
+
     prompt = (
         "Ти досвідчений SMC трейдер. Проведи повний топ-даун аналіз.\n\n"
         "ІНСТРУМЕНТ: " + instrument.replace("_", "/") + "\n"
@@ -609,7 +558,7 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "4H: " + trend_arrow(smc_data.get("structure_H4", {}).get("trend", "unknown")) + "\n"
         "1H: " + trend_arrow(smc_data.get("structure_H1", {}).get("trend", "unknown")) + "\n"
         "15M: " + trend_arrow(smc_data.get("structure_M15", {}).get("trend", "unknown")) + "\n\n"
-        "=== РІВНІ ===\n"
+        "=== КЛЮЧОВІ РІВНІ ===\n"
         "PMH/PML: " + str(key.get("PMH", "N/A")) + " / " + str(key.get("PML", "N/A")) + "\n"
         "PWH/PWL: " + str(key.get("PWH", "N/A")) + " / " + str(key.get("PWL", "N/A")) + "\n"
         "PDH/PDL: " + str(key.get("PDH", "N/A")) + " / " + str(key.get("PDL", "N/A")) + "\n\n"
@@ -628,13 +577,12 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "4H: " + sweep_str(smc_data.get("sweep_H4")) + "\n"
         "1H: " + sweep_str(smc_data.get("sweep_H1")) + "\n"
         "15M: " + sweep_str(smc_data.get("sweep_M15")) + "\n\n"
-        "=== FIBONACCI (1H swing) ===\n"
-        "Swing High: " + str(smc_data.get("fibonacci", {}).get("swing_high", "N/A")) + "\n"
-        "Swing Low: " + str(smc_data.get("fibonacci", {}).get("swing_low", "N/A")) + "\n"
-        "Fib 0.5:   " + str(smc_data.get("fibonacci", {}).get("fib_0_5", "N/A")) + "\n"
-        "Fib 0.618: " + str(smc_data.get("fibonacci", {}).get("fib_0_618", "N/A")) + "\n"
-        "Fib 0.705: " + str(smc_data.get("fibonacci", {}).get("fib_0_705", "N/A")) + "\n"
-        "Fib 0.79:  " + str(smc_data.get("fibonacci", {}).get("fib_0_79", "N/A")) + "\n\n"
+        "=== FIBONACCI (1H) ===\n"
+        "High: " + str(fib.get("swing_high", "N/A")) + " | Low: " + str(fib.get("swing_low", "N/A")) + "\n"
+        "0.5:   " + str(fib.get("fib_0_5", "N/A")) + "\n"
+        "0.618: " + str(fib.get("fib_0_618", "N/A")) + "\n"
+        "0.705: " + str(fib.get("fib_0_705", "N/A")) + "\n"
+        "0.79:  " + str(fib.get("fib_0_79", "N/A")) + "\n\n"
         "=== PREMIUM/DISCOUNT ===\n"
         "4H: " + pd_str(smc_data.get("pd_zone_H4", {})) + "\n"
         "1H: " + pd_str(smc_data.get("pd_zone_H1", {})) + "\n\n"
@@ -650,7 +598,6 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "4. SELL сценарій (використай розраховані рівні вище)\n"
         "5. ТРИГЕР на 15M\n6. ВИСНОВОК"
     )
-    setups = calculate_setups(instrument, smc_data)
 
     if alert_mode:
         prompt += "\n\nКОРОТКО: починай з ALERT, тільки головне — напрям/вхід/SL/TP."
@@ -680,7 +627,6 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
     display = instrument.replace("_", "/")
     score = smc_data.get("setup_quality", 0)
     stars = "★" * score + "☆" * (5 - score)
-
     header = (
         emoji + " *" + display + "* | `" + "{:.5f}".format(price) + "`\n"
         + session_info["name"] + " " + session_info["emoji"] + " | " + stars + "\n"
@@ -695,15 +641,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *SMC Trading Bot*\n\n"
         "Аналізую ринок за Smart Money концепцією:\n"
-        "BOS/CHoCH · OB · FVG · Liquidity Sweeps\n\n"
+        "BOS/CHoCH · OB · FVG · Liquidity Sweeps · Fibonacci\n\n"
         "*Команди:*\n"
-        "`/analyze XAUUSD`\n"
-        "`/analyze EURUSD`\n"
-        "`/analyze GBPUSD`\n"
-        "`/analyze BTCUSD`\n\n"
+        "`/xauusd` — Аналіз Gold\n"
+        "`/eurusd` — Аналіз EUR/USD\n"
+        "`/gbpusd` — Аналіз GBP/USD\n"
+        "`/btcusd` — Аналіз Bitcoin\n\n"
         "`/alerts on` — автоматичні алерти\n"
         "`/alerts off` — вимкнути\n"
-        "`/status` — статус бота"
+        "`/status` — статус бота\n\n"
+        "_Killzones: Лондон 08-12 UTC · Нью-Йорк 13-17 UTC_"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -713,7 +660,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text("Вкажи інструмент: `/analyze XAUUSD`", parse_mode=ParseMode.MARKDOWN)
         return
-
     raw = args[0].upper().replace("/", "_")
     aliases = {
         "EURUSD": "EUR_USD", "GBPUSD": "GBP_USD",
@@ -726,32 +672,41 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not instrument:
         await update.message.reply_text("Невідомий інструмент. Доступні: EURUSD, GBPUSD, XAUUSD, BTCUSD")
         return
-
     emoji_map = {"EUR_USD": "🇪🇺", "GBP_USD": "🇬🇧", "XAU_USD": "🥇", "BTC_USD": "₿"}
     emoji = emoji_map.get(instrument, "📊")
     display = instrument.replace("_", "/")
-
     msg = await update.message.reply_text(
-        emoji + " *" + display + "* — завантажую дані...",
-        parse_mode=ParseMode.MARKDOWN
+        emoji + " *" + display + "* — завантажую дані...", parse_mode=ParseMode.MARKDOWN
     )
-
     try:
         await msg.edit_text(emoji + " *" + display + "* — збираю свічки (6 TF)...", parse_mode=ParseMode.MARKDOWN)
         candles = await fetch_candles(instrument, TWELVEDATA_API_KEY)
-
         await msg.edit_text(emoji + " *" + display + "* — аналізую SMC структуру...", parse_mode=ParseMode.MARKDOWN)
         smc_data = analyze_smc(candles)
         session_info = get_session_info()
-
         await msg.edit_text(emoji + " *" + display + "* — AI генерує аналіз...", parse_mode=ParseMode.MARKDOWN)
         analysis = await get_ai_analysis(instrument, smc_data, session_info)
-
         await msg.edit_text(analysis, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
     except Exception as e:
         logger.error("Analysis error: " + str(e), exc_info=True)
         await msg.edit_text("Помилка аналізу " + display + ":\n`" + str(e)[:200] + "`", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_xauusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["XAUUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_eurusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["EURUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_gbpusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["GBPUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_btcusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["BTCUSD"]
+    await cmd_analyze(update, context)
 
 
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -776,11 +731,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alert_status = "✅ Увімкнені" if chat_id in ALERT_USERS else "🔕 Вимкнені"
     session = get_session_info()
     now = datetime.now(timezone.utc)
+    kz = "✅ Активна" if is_killzone() else "⏸ Не активна"
     text = (
         "🤖 *SMC Bot*\n\n"
         "UTC: `" + now.strftime("%H:%M %d.%m.%Y") + "`\n"
         "Сесія: *" + session["name"] + "* " + session["emoji"] + "\n"
-        "Алерти: " + alert_status + "\n"
+        "Killzone: " + kz + "\n"
+        "Алерти: " + alert_status + "\n\n"
         "Інструменти: EUR/USD · GBP/USD · XAU/USD · BTC/USD"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -793,39 +750,29 @@ async def alert_loop(app):
     while True:
         try:
             if ALERT_USERS:
-                # Skip Asian session entirely
                 if is_asian_session():
                     logger.info("Asian session — skipping alerts")
                     await asyncio.sleep(15 * 60)
                     continue
-
-                # Only send alerts during killzones
                 if not is_killzone():
                     logger.info("Not in killzone — skipping alerts")
                     await asyncio.sleep(15 * 60)
                     continue
-
                 for instrument in INSTRUMENTS:
                     try:
                         candles = await fetch_candles(instrument, TWELVEDATA_API_KEY)
                         smc_data = analyze_smc(candles)
-
                         if smc_data.get("has_setup") and smc_data.get("setup_quality", 0) >= 3:
                             current_price = smc_data.get("current_price", 0)
                             pv = pip_value(instrument)
-
-                            # Deduplication: check if price moved enough since last alert
                             last_price = SENT_ALERTS.get(instrument, 0)
                             price_change_pips = abs(current_price - last_price) / pv if pv > 0 else 999
-
                             if price_change_pips < MIN_PRICE_CHANGE_PIPS:
                                 logger.info("Skipping " + instrument + " — price unchanged (" + str(round(price_change_pips)) + " pips)")
                                 await asyncio.sleep(3)
                                 continue
-
                             session_info = get_session_info()
                             analysis = await get_ai_analysis(instrument, smc_data, session_info, alert_mode=True)
-
                             sent_ok = False
                             for chat_id in list(ALERT_USERS):
                                 try:
@@ -838,12 +785,9 @@ async def alert_loop(app):
                                     sent_ok = True
                                 except Exception as e:
                                     logger.error("Alert send error: " + str(e))
-
-                            # Save price only if alert was sent
                             if sent_ok:
                                 SENT_ALERTS[instrument] = current_price
                                 logger.info("Alert sent for " + instrument + " at " + str(current_price))
-
                         await asyncio.sleep(3)
                     except Exception as e:
                         logger.error("Alert scan error " + instrument + ": " + str(e))
@@ -851,40 +795,6 @@ async def alert_loop(app):
             logger.error("Alert loop error: " + str(e))
         await asyncio.sleep(15 * 60)
 
-
-
-async def cmd_xauusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["XAUUSD"]
-    await cmd_analyze(update, context)
-
-async def cmd_eurusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["EURUSD"]
-    await cmd_analyze(update, context)
-
-async def cmd_gbpusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["GBPUSD"]
-    await cmd_analyze(update, context)
-
-async def cmd_btcusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["BTCUSD"]
-    await cmd_analyze(update, context)
-
-
-async def cmd_xauusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["XAUUSD"]
-    await cmd_analyze(update, context)
-
-async def cmd_eurusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["EURUSD"]
-    await cmd_analyze(update, context)
-
-async def cmd_gbpusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["GBPUSD"]
-    await cmd_analyze(update, context)
-
-async def cmd_btcusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["BTCUSD"]
-    await cmd_analyze(update, context)
 
 async def post_init(app):
     asyncio.create_task(alert_loop(app))
@@ -898,10 +808,6 @@ def main():
     app.add_handler(CommandHandler("eurusd", cmd_eurusd))
     app.add_handler(CommandHandler("gbpusd", cmd_gbpusd))
     app.add_handler(CommandHandler("btcusd", cmd_btcusd))
-    app.add_handler(CommandHandler("analyze_xauusd", cmd_xauusd))
-    app.add_handler(CommandHandler("analyze_eurusd", cmd_eurusd))
-    app.add_handler(CommandHandler("analyze_gbpusd", cmd_gbpusd))
-    app.add_handler(CommandHandler("analyze_btcusd", cmd_btcusd))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("status", cmd_status))
     logger.info("SMC Trading Bot started!")
