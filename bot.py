@@ -291,6 +291,150 @@ def analyze_smc(candles_by_tf):
     return result
 
 
+
+
+# ── CALCULATIONS ──────────────────────────────────────────────────────────────
+
+def pip_value(instrument):
+    """Return pip size for instrument."""
+    if "JPY" in instrument:
+        return 0.01
+    if "XAU" in instrument:
+        return 0.01
+    if "BTC" in instrument:
+        return 1.0
+    return 0.0001
+
+
+def pips(price_diff, instrument):
+    """Convert price difference to pips."""
+    pv = pip_value(instrument)
+    return round(abs(price_diff) / pv)
+
+
+def calc_rr(entry, sl, tp):
+    """Calculate Risk:Reward ratio."""
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    if risk == 0:
+        return 0
+    return round(reward / risk, 1)
+
+
+def calculate_setups(instrument, smc_data):
+    """Calculate BUY and SELL setups with exact SL/TP/RR/pips."""
+    price = smc_data.get("current_price", 0)
+    key = smc_data.get("key_levels", {})
+    ob_h1 = smc_data.get("ob_H1", [])
+    ob_m15 = smc_data.get("ob_M15", [])
+    fvg_h1 = smc_data.get("fvg_H1", [])
+    fvg_m15 = smc_data.get("fvg_M15", [])
+    pd_h1 = smc_data.get("pd_zone_H1", {})
+    structure_h1 = smc_data.get("structure_H1", {})
+    trend = structure_h1.get("trend", "unknown")
+
+    pv = pip_value(instrument)
+    setups = {}
+
+    # ── BUY SETUP ──
+    # Entry: bottom of nearest bullish OB or FVG below price
+    buy_obs = [o for o in ob_h1 if o["type"] == "bullish_ob" and o["bottom"] < price]
+    buy_fvgs = [f for f in fvg_h1 if f["type"] == "bullish_fvg" and f["bottom"] < price]
+
+    buy_entry = None
+    buy_sl = None
+    buy_tp1 = None
+    buy_tp2 = None
+
+    if buy_obs:
+        ob = buy_obs[-1]
+        buy_entry = round((ob["top"] + ob["bottom"]) / 2, 5)
+        buy_sl = round(ob["bottom"] - pv * 5, 5)  # 5 pips below OB
+    elif buy_fvgs:
+        fvg = buy_fvgs[-1]
+        buy_entry = round(fvg["mid"], 5)
+        buy_sl = round(fvg["bottom"] - pv * 5, 5)
+
+    if buy_entry and buy_sl:
+        risk = abs(buy_entry - buy_sl)
+        buy_tp1 = round(buy_entry + risk * 2, 5)  # RR 1:2
+        buy_tp2 = round(buy_entry + risk * 3, 5)  # RR 1:3
+        # Override TP with key levels if closer
+        pdh = key.get("PDH")
+        pwh = key.get("PWH")
+        if pdh and pdh > buy_entry:
+            buy_tp1 = round(pdh, 5)
+        if pwh and pwh > buy_entry:
+            buy_tp2 = round(pwh, 5)
+
+        setups["buy"] = {
+            "entry": buy_entry,
+            "sl": buy_sl,
+            "tp1": buy_tp1,
+            "tp2": buy_tp2,
+            "sl_pips": pips(buy_entry - buy_sl, instrument),
+            "tp1_pips": pips(buy_tp1 - buy_entry, instrument),
+            "tp2_pips": pips(buy_tp2 - buy_entry, instrument),
+            "rr1": calc_rr(buy_entry, buy_sl, buy_tp1),
+            "rr2": calc_rr(buy_entry, buy_sl, buy_tp2),
+        }
+
+    # ── SELL SETUP ──
+    sell_obs = [o for o in ob_h1 if o["type"] == "bearish_ob" and o["top"] > price]
+    sell_fvgs = [f for f in fvg_h1 if f["type"] == "bearish_fvg" and f["top"] > price]
+
+    sell_entry = None
+    sell_sl = None
+    sell_tp1 = None
+    sell_tp2 = None
+
+    if sell_obs:
+        ob = sell_obs[0]
+        sell_entry = round((ob["top"] + ob["bottom"]) / 2, 5)
+        sell_sl = round(ob["top"] + pv * 5, 5)
+    elif sell_fvgs:
+        fvg = sell_fvgs[0]
+        sell_entry = round(fvg["mid"], 5)
+        sell_sl = round(fvg["top"] + pv * 5, 5)
+
+    if sell_entry and sell_sl:
+        risk = abs(sell_entry - sell_sl)
+        sell_tp1 = round(sell_entry - risk * 2, 5)
+        sell_tp2 = round(sell_entry - risk * 3, 5)
+        pdl = key.get("PDL")
+        pwl = key.get("PWL")
+        if pdl and pdl < sell_entry:
+            sell_tp1 = round(pdl, 5)
+        if pwl and pwl < sell_entry:
+            sell_tp2 = round(pwl, 5)
+
+        setups["sell"] = {
+            "entry": sell_entry,
+            "sl": sell_sl,
+            "tp1": sell_tp1,
+            "tp2": sell_tp2,
+            "sl_pips": pips(sell_entry - sell_sl, instrument),
+            "tp1_pips": pips(sell_entry - sell_tp1, instrument),
+            "tp2_pips": pips(sell_entry - sell_tp2, instrument),
+            "rr1": calc_rr(sell_entry, sell_sl, sell_tp1),
+            "rr2": calc_rr(sell_entry, sell_sl, sell_tp2),
+        }
+
+    return setups
+
+
+def format_setup(setup, direction):
+    """Format setup as readable string for AI prompt."""
+    if not setup:
+        return "зона не визначена"
+    arrow = "BUY" if direction == "buy" else "SELL"
+    return (
+        arrow + " Entry: " + "{:.5f}".format(setup["entry"]) +
+        " | SL: " + "{:.5f}".format(setup["sl"]) + " (" + str(setup["sl_pips"]) + " pips)" +
+        " | TP1: " + "{:.5f}".format(setup["tp1"]) + " (" + str(setup["tp1_pips"]) + " pips, RR 1:" + str(setup["rr1"]) + ")" +
+        " | TP2: " + "{:.5f}".format(setup["tp2"]) + " (" + str(setup["tp2_pips"]) + " pips, RR 1:" + str(setup["rr2"]) + ")"
+    )
+
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
@@ -342,6 +486,7 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         labels = {"premium": "Premium", "discount": "Discount", "equilibrium": "Equilibrium"}
         return labels.get(zone, zone) + " (" + str(pct) + "%, EQ: " + "{:.5f}".format(eq if eq else 0) + ")"
 
+    setups = calculate_setups(instrument, smc_data)
     prompt = (
         "Ти досвідчений SMC трейдер. Проведи повний топ-даун аналіз.\n\n"
         "ІНСТРУМЕНТ: " + instrument.replace("_", "/") + "\n"
@@ -378,10 +523,17 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "1H: " + pd_str(smc_data.get("pd_zone_H1", {})) + "\n\n"
         "SCORE: " + str(smc_data.get("setup_quality", 0)) + "/5\n\n"
         "ПРАВИЛА: RR мін 1:2, ціль 1:3+, ризик 0.5-1%, prop challenge +8%\n\n"
+        "=== РОЗРАХОВАНІ РІВНІ (використовуй ТІЛЬКИ ЦІ цифри!) ===\n"
+        "BUY: " + format_setup(setups.get("buy"), "buy") + "\n"
+        "SELL: " + format_setup(setups.get("sell"), "sell") + "\n\n"
+        "ВАЖЛИВО: НЕ придумуй свої рівні! Використовуй тільки цифри вище.\n\n"
         "Дай відповідь УКРАЇНСЬКОЮ, формат Telegram Markdown:\n"
-        "1. BIAS\n2. СИТУАЦІЯ\n3. BUY сценарій (вхід/SL/TP1/TP2/RR)\n"
-        "4. SELL сценарій (вхід/SL/TP1/TP2/RR)\n5. ТРИГЕР на 15M\n6. ВИСНОВОК"
+        "1. BIAS\n2. СИТУАЦІЯ\n"
+        "3. BUY сценарій (використай розраховані рівні вище)\n"
+        "4. SELL сценарій (використай розраховані рівні вище)\n"
+        "5. ТРИГЕР на 15M\n6. ВИСНОВОК"
     )
+    setups = calculate_setups(instrument, smc_data)
 
     if alert_mode:
         prompt += "\n\nКОРОТКО: починай з ALERT, тільки головне — напрям/вхід/SL/TP."
