@@ -360,6 +360,17 @@ def pip_value(instrument):
     return 0.0001
 
 
+def sl_buffer(instrument):
+    """Return minimum SL buffer beyond OB/FVG edge."""
+    if "BTC" in instrument:
+        return 150    # $150 buffer for BTC
+    if "XAU" in instrument:
+        return 1.5    # $1.5 buffer for Gold
+    if "JPY" in instrument:
+        return 0.15   # 15 pips for JPY pairs
+    return 0.00100    # 10 pips for forex
+
+
 def pips(price_diff, instrument):
     """Convert price difference to pips."""
     pv = pip_value(instrument)
@@ -376,50 +387,74 @@ def calc_rr(entry, sl, tp):
 
 
 def calculate_setups(instrument, smc_data):
-    """Calculate BUY and SELL setups with exact SL/TP/RR/pips."""
+    """Calculate BUY and SELL setups with SL behind last swing high/low."""
     price = smc_data.get("current_price", 0)
     key = smc_data.get("key_levels", {})
     ob_h1 = smc_data.get("ob_H1", [])
-    ob_m15 = smc_data.get("ob_M15", [])
     fvg_h1 = smc_data.get("fvg_H1", [])
-    fvg_m15 = smc_data.get("fvg_M15", [])
-    pd_h1 = smc_data.get("pd_zone_H1", {})
     structure_h1 = smc_data.get("structure_H1", {})
-    trend = structure_h1.get("trend", "unknown")
+    structure_m15 = smc_data.get("structure_M15", {})
 
-    pv = pip_value(instrument)
+    # Get swing highs/lows for SL placement
+    swing_highs_h1 = structure_h1.get("swing_highs", [])
+    swing_lows_h1 = structure_h1.get("swing_lows", [])
+    swing_highs_m15 = structure_m15.get("swing_highs", [])
+    swing_lows_m15 = structure_m15.get("swing_lows", [])
+
+    buf = sl_buffer(instrument)
     setups = {}
 
     # ── BUY SETUP ──
-    # Entry: bottom of nearest bullish OB or FVG below price
     buy_obs = [o for o in ob_h1 if o["type"] == "bullish_ob" and o["bottom"] < price]
     buy_fvgs = [f for f in fvg_h1 if f["type"] == "bullish_fvg" and f["bottom"] < price]
 
     buy_entry = None
     buy_sl = None
-    buy_tp1 = None
-    buy_tp2 = None
 
     if buy_obs:
         ob = buy_obs[-1]
-        buy_entry = round((ob["top"] + ob["bottom"]) / 2, 5)
-        buy_sl = round(ob["bottom"] - pv * 5, 5)  # 5 pips below OB
+        buy_entry = round(ob["top"], 5)  # Entry at top of bullish OB
+        # SL: behind last swing low on 15M below entry
+        lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
+        if lows_below:
+            buy_sl = round(min(lows_below) - buf, 5)
+        else:
+            # Fallback: behind OB bottom
+            lows_h1_below = [l["price"] for l in swing_lows_h1 if l["price"] < buy_entry]
+            if lows_h1_below:
+                buy_sl = round(min(lows_h1_below) - buf, 5)
+            else:
+                buy_sl = round(ob["bottom"] - buf, 5)
+
     elif buy_fvgs:
         fvg = buy_fvgs[-1]
-        buy_entry = round(fvg["mid"], 5)
-        buy_sl = round(fvg["bottom"] - pv * 5, 5)
+        buy_entry = round(fvg["top"], 5)
+        lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
+        if lows_below:
+            buy_sl = round(min(lows_below) - buf, 5)
+        else:
+            buy_sl = round(fvg["bottom"] - buf, 5)
 
     if buy_entry and buy_sl:
         risk = abs(buy_entry - buy_sl)
-        buy_tp1 = round(buy_entry + risk * 2, 5)  # RR 1:2
-        buy_tp2 = round(buy_entry + risk * 3, 5)  # RR 1:3
-        # Override TP with key levels if closer
+        # Sanity check — risk must be positive and reasonable
+        if risk <= 0:
+            risk = buf * 3
+            buy_sl = round(buy_entry - risk, 5)
+
+        buy_tp1 = round(buy_entry + risk * 2, 5)
+        buy_tp2 = round(buy_entry + risk * 3, 5)
+
+        # Use key levels as TP targets if they make sense
         pdh = key.get("PDH")
         pwh = key.get("PWH")
-        if pdh and pdh > buy_entry:
+        if pdh and buy_entry < pdh < buy_tp2:
             buy_tp1 = round(pdh, 5)
-        if pwh and pwh > buy_entry:
+        if pwh and buy_entry < pwh:
             buy_tp2 = round(pwh, 5)
+
+        rr1 = calc_rr(buy_entry, buy_sl, buy_tp1)
+        rr2 = calc_rr(buy_entry, buy_sl, buy_tp2)
 
         setups["buy"] = {
             "entry": buy_entry,
@@ -429,8 +464,8 @@ def calculate_setups(instrument, smc_data):
             "sl_pips": pips(buy_entry - buy_sl, instrument),
             "tp1_pips": pips(buy_tp1 - buy_entry, instrument),
             "tp2_pips": pips(buy_tp2 - buy_entry, instrument),
-            "rr1": calc_rr(buy_entry, buy_sl, buy_tp1),
-            "rr2": calc_rr(buy_entry, buy_sl, buy_tp2),
+            "rr1": rr1,
+            "rr2": rr2,
         }
 
     # ── SELL SETUP ──
@@ -439,28 +474,48 @@ def calculate_setups(instrument, smc_data):
 
     sell_entry = None
     sell_sl = None
-    sell_tp1 = None
-    sell_tp2 = None
 
     if sell_obs:
         ob = sell_obs[0]
-        sell_entry = round((ob["top"] + ob["bottom"]) / 2, 5)
-        sell_sl = round(ob["top"] + pv * 5, 5)
+        sell_entry = round(ob["bottom"], 5)  # Entry at bottom of bearish OB
+        # SL: behind last swing high on 15M above entry
+        highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
+        if highs_above:
+            sell_sl = round(max(highs_above) + buf, 5)
+        else:
+            highs_h1_above = [h["price"] for h in swing_highs_h1 if h["price"] > sell_entry]
+            if highs_h1_above:
+                sell_sl = round(max(highs_h1_above) + buf, 5)
+            else:
+                sell_sl = round(ob["top"] + buf, 5)
+
     elif sell_fvgs:
         fvg = sell_fvgs[0]
-        sell_entry = round(fvg["mid"], 5)
-        sell_sl = round(fvg["top"] + pv * 5, 5)
+        sell_entry = round(fvg["bottom"], 5)
+        highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
+        if highs_above:
+            sell_sl = round(max(highs_above) + buf, 5)
+        else:
+            sell_sl = round(fvg["top"] + buf, 5)
 
     if sell_entry and sell_sl:
         risk = abs(sell_entry - sell_sl)
+        if risk <= 0:
+            risk = buf * 3
+            sell_sl = round(sell_entry + risk, 5)
+
         sell_tp1 = round(sell_entry - risk * 2, 5)
         sell_tp2 = round(sell_entry - risk * 3, 5)
+
         pdl = key.get("PDL")
         pwl = key.get("PWL")
-        if pdl and pdl < sell_entry:
+        if pdl and sell_tp2 < pdl < sell_entry:
             sell_tp1 = round(pdl, 5)
         if pwl and pwl < sell_entry:
             sell_tp2 = round(pwl, 5)
+
+        rr1 = calc_rr(sell_entry, sell_sl, sell_tp1)
+        rr2 = calc_rr(sell_entry, sell_sl, sell_tp2)
 
         setups["sell"] = {
             "entry": sell_entry,
@@ -470,8 +525,8 @@ def calculate_setups(instrument, smc_data):
             "sl_pips": pips(sell_entry - sell_sl, instrument),
             "tp1_pips": pips(sell_entry - sell_tp1, instrument),
             "tp2_pips": pips(sell_entry - sell_tp2, instrument),
-            "rr1": calc_rr(sell_entry, sell_sl, sell_tp1),
-            "rr2": calc_rr(sell_entry, sell_sl, sell_tp2),
+            "rr1": rr1,
+            "rr2": rr2,
         }
 
     return setups
