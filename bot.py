@@ -20,6 +20,24 @@ TWELVEDATA_BASE = "https://api.twelvedata.com"
 ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 INSTRUMENTS = ["EUR_USD", "GBP_USD", "XAU_USD", "BTC_USD"]
 ALERT_USERS = set()
+SENT_ALERTS = {}  # instrument -> last alert price (deduplication)
+MIN_PRICE_CHANGE_PIPS = 20  # min pips change before resending same setup
+
+
+def is_killzone():
+    """Check if current time is in London or NY killzone."""
+    hour = datetime.now(timezone.utc).hour
+    # London killzone: 08:00-12:00 UTC
+    # New York killzone: 13:00-17:00 UTC
+    return (8 <= hour < 12) or (13 <= hour < 17)
+
+
+def is_asian_session():
+    """Check if current time is Asian session."""
+    hour = datetime.now(timezone.utc).hour
+    return 22 <= hour or hour < 8
+
+
 
 SYMBOL_MAP = {
     "EUR_USD": "EUR/USD",
@@ -240,6 +258,27 @@ def get_premium_discount(candles):
             "range_high": high, "range_low": low}
 
 
+
+
+def calculate_fibonacci(candles):
+    """Calculate Fibonacci levels from last significant swing."""
+    if len(candles) < 20:
+        return {}
+    recent = candles[-50:] if len(candles) >= 50 else candles
+    swing_high = max(c["h"] for c in recent)
+    swing_low = min(c["l"] for c in recent)
+    diff = swing_high - swing_low
+    if diff == 0:
+        return {}
+    return {
+        "swing_high": round(swing_high, 5),
+        "swing_low": round(swing_low, 5),
+        "fib_0_5":   round(swing_high - diff * 0.500, 5),
+        "fib_0_618": round(swing_high - diff * 0.618, 5),
+        "fib_0_705": round(swing_high - diff * 0.705, 5),
+        "fib_0_79":  round(swing_high - diff * 0.790, 5),
+    }
+
 def get_key_levels(candles_by_tf):
     levels = {}
     d_candles = candles_by_tf.get("D", [])
@@ -288,6 +327,11 @@ def analyze_smc(candles_by_tf):
         score += 1
     result["setup_quality"] = score
     result["has_setup"] = score >= 3
+
+    # Fibonacci from 1H candles
+    h1_candles = candles_by_tf.get("H1", [])
+    result["fibonacci"] = calculate_fibonacci(h1_candles)
+
     return result
 
 
@@ -518,6 +562,13 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "4H: " + sweep_str(smc_data.get("sweep_H4")) + "\n"
         "1H: " + sweep_str(smc_data.get("sweep_H1")) + "\n"
         "15M: " + sweep_str(smc_data.get("sweep_M15")) + "\n\n"
+        "=== FIBONACCI (1H swing) ===\n"
+        "Swing High: " + str(smc_data.get("fibonacci", {}).get("swing_high", "N/A")) + "\n"
+        "Swing Low: " + str(smc_data.get("fibonacci", {}).get("swing_low", "N/A")) + "\n"
+        "Fib 0.5:   " + str(smc_data.get("fibonacci", {}).get("fib_0_5", "N/A")) + "\n"
+        "Fib 0.618: " + str(smc_data.get("fibonacci", {}).get("fib_0_618", "N/A")) + "\n"
+        "Fib 0.705: " + str(smc_data.get("fibonacci", {}).get("fib_0_705", "N/A")) + "\n"
+        "Fib 0.79:  " + str(smc_data.get("fibonacci", {}).get("fib_0_79", "N/A")) + "\n\n"
         "=== PREMIUM/DISCOUNT ===\n"
         "4H: " + pd_str(smc_data.get("pd_zone_H4", {})) + "\n"
         "1H: " + pd_str(smc_data.get("pd_zone_H1", {})) + "\n\n"
@@ -676,13 +727,40 @@ async def alert_loop(app):
     while True:
         try:
             if ALERT_USERS:
+                # Skip Asian session entirely
+                if is_asian_session():
+                    logger.info("Asian session — skipping alerts")
+                    await asyncio.sleep(15 * 60)
+                    continue
+
+                # Only send alerts during killzones
+                if not is_killzone():
+                    logger.info("Not in killzone — skipping alerts")
+                    await asyncio.sleep(15 * 60)
+                    continue
+
                 for instrument in INSTRUMENTS:
                     try:
                         candles = await fetch_candles(instrument, TWELVEDATA_API_KEY)
                         smc_data = analyze_smc(candles)
+
                         if smc_data.get("has_setup") and smc_data.get("setup_quality", 0) >= 3:
+                            current_price = smc_data.get("current_price", 0)
+                            pv = pip_value(instrument)
+
+                            # Deduplication: check if price moved enough since last alert
+                            last_price = SENT_ALERTS.get(instrument, 0)
+                            price_change_pips = abs(current_price - last_price) / pv if pv > 0 else 999
+
+                            if price_change_pips < MIN_PRICE_CHANGE_PIPS:
+                                logger.info("Skipping " + instrument + " — price unchanged (" + str(round(price_change_pips)) + " pips)")
+                                await asyncio.sleep(3)
+                                continue
+
                             session_info = get_session_info()
                             analysis = await get_ai_analysis(instrument, smc_data, session_info, alert_mode=True)
+
+                            sent_ok = False
                             for chat_id in list(ALERT_USERS):
                                 try:
                                     await app.bot.send_message(
@@ -691,8 +769,15 @@ async def alert_loop(app):
                                         parse_mode=ParseMode.MARKDOWN,
                                         disable_web_page_preview=True
                                     )
+                                    sent_ok = True
                                 except Exception as e:
                                     logger.error("Alert send error: " + str(e))
+
+                            # Save price only if alert was sent
+                            if sent_ok:
+                                SENT_ALERTS[instrument] = current_price
+                                logger.info("Alert sent for " + instrument + " at " + str(current_price))
+
                         await asyncio.sleep(3)
                     except Exception as e:
                         logger.error("Alert scan error " + instrument + ": " + str(e))
@@ -700,6 +785,23 @@ async def alert_loop(app):
             logger.error("Alert loop error: " + str(e))
         await asyncio.sleep(15 * 60)
 
+
+
+async def cmd_xauusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["XAUUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_eurusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["EURUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_gbpusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["GBPUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_btcusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["BTCUSD"]
+    await cmd_analyze(update, context)
 
 async def post_init(app):
     asyncio.create_task(alert_loop(app))
@@ -709,6 +811,10 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
+    app.add_handler(CommandHandler("analyze_xauusd", cmd_xauusd))
+    app.add_handler(CommandHandler("analyze_eurusd", cmd_eurusd))
+    app.add_handler(CommandHandler("analyze_gbpusd", cmd_gbpusd))
+    app.add_handler(CommandHandler("analyze_btcusd", cmd_btcusd))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("status", cmd_status))
     logger.info("SMC Trading Bot started!")
