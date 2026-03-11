@@ -479,15 +479,27 @@ def calculate_setups(instrument, smc_data):
     return setups
 
 
-def format_setup(setup, direction):
+def format_distance(pips_val, instrument):
+    """Show pips for forex, dollars for XAU/BTC."""
+    if "XAU" in instrument:
+        return "$" + "{:.2f}".format(pips_val * 0.01)
+    if "BTC" in instrument:
+        return "$" + "{:.0f}".format(pips_val)
+    return str(pips_val) + " pips"
+
+
+def format_setup(setup, direction, instrument=""):
     if not setup:
         return "зона не визначена"
     arrow = "BUY" if direction == "buy" else "SELL"
+    sl_dist = format_distance(setup["sl_pips"], instrument)
+    tp1_dist = format_distance(setup["tp1_pips"], instrument)
+    tp2_dist = format_distance(setup["tp2_pips"], instrument)
     return (
         arrow + " Entry: " + "{:.5f}".format(setup["entry"]) +
-        " | SL: " + "{:.5f}".format(setup["sl"]) + " (" + str(setup["sl_pips"]) + " pips)" +
-        " | TP1: " + "{:.5f}".format(setup["tp1"]) + " (" + str(setup["tp1_pips"]) + " pips, RR 1:" + str(setup["rr1"]) + ")" +
-        " | TP2: " + "{:.5f}".format(setup["tp2"]) + " (" + str(setup["tp2_pips"]) + " pips, RR 1:" + str(setup["rr2"]) + ")"
+        " | SL: " + "{:.5f}".format(setup["sl"]) + " (" + sl_dist + ")" +
+        " | TP1: " + "{:.5f}".format(setup["tp1"]) + " (" + tp1_dist + ", RR 1:" + str(setup["rr1"]) + ")" +
+        " | TP2: " + "{:.5f}".format(setup["tp2"]) + " (" + tp2_dist + ", RR 1:" + str(setup["rr2"]) + ")"
     )
 
 
@@ -589,7 +601,7 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "SCORE: " + str(smc_data.get("setup_quality", 0)) + "/5\n\n"
         "ПРАВИЛА: RR мін 1:2, ціль 1:3+, ризик 0.5-1%, prop challenge +8%\n\n"
         "=== РОЗРАХОВАНІ РІВНІ (використовуй ТІЛЬКИ ЦІ цифри!) ===\n"
-        "BUY: " + format_setup(setups.get("buy"), "buy") + "\n"
+        "BUY: " + format_setup(setups.get("buy"), "buy", instrument) + "\n"
         "SELL: " + format_setup(setups.get("sell"), "sell") + "\n\n"
         "ВАЖЛИВО: НЕ придумуй свої рівні! Використовуй тільки цифри вище.\n\n"
         "Дай відповідь УКРАЇНСЬКОЮ, формат Telegram Markdown:\n"
