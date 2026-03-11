@@ -206,12 +206,22 @@ def find_fvg(candles):
         elif nxt["h"] < prev["l"]:
             fvgs.append({"type": "bearish_fvg", "top": prev["l"], "bottom": nxt["h"],
                          "mid": (prev["l"] + nxt["h"]) / 2, "filled": False})
+    # Full fill: price must close BEYOND the entire FVG (not just mid)
+    last_low = candles[-1]["l"] if candles else 0
+    last_high = candles[-1]["h"] if candles else 0
     last_close = candles[-1]["c"] if candles else 0
     for fvg in fvgs:
-        if fvg["type"] == "bullish_fvg" and last_close < fvg["bottom"]:
-            fvg["filled"] = True
-        elif fvg["type"] == "bearish_fvg" and last_close > fvg["top"]:
-            fvg["filled"] = True
+        if fvg["type"] == "bullish_fvg":
+            # Full fill: price closed below the bottom of bullish FVG
+            if last_close < fvg["bottom"]:
+                fvg["filled"] = True
+            # Partial fill tracker
+            fvg["partial"] = last_low < fvg["top"] and last_close > fvg["bottom"]
+        elif fvg["type"] == "bearish_fvg":
+            # Full fill: price closed above the top of bearish FVG
+            if last_close > fvg["top"]:
+                fvg["filled"] = True
+            fvg["partial"] = last_high > fvg["bottom"] and last_close < fvg["top"]
     return [f for f in fvgs if not f["filled"]][-4:]
 
 
@@ -503,7 +513,8 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         lines = []
         for f in fvgs[-2:]:
             d = "Bullish" if "bullish" in f["type"] else "Bearish"
-            lines.append("  " + d + " FVG: " + "{:.5f}".format(f["bottom"]) + " - " + "{:.5f}".format(f["top"]))
+            status = " [PARTIAL FILL]" if f.get("partial") else " [FRESH]"
+            lines.append("  " + d + " FVG" + status + ": " + "{:.5f}".format(f["bottom"]) + " - " + "{:.5f}".format(f["top"]))
         return "\n".join(lines)
 
     def liq_str(liq):
@@ -803,6 +814,23 @@ async def cmd_btcusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.args = ["BTCUSD"]
     await cmd_analyze(update, context)
 
+
+async def cmd_xauusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["XAUUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_eurusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["EURUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_gbpusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["GBPUSD"]
+    await cmd_analyze(update, context)
+
+async def cmd_btcusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.args = ["BTCUSD"]
+    await cmd_analyze(update, context)
+
 async def post_init(app):
     asyncio.create_task(alert_loop(app))
 
@@ -811,6 +839,10 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
+    app.add_handler(CommandHandler("xauusd", cmd_xauusd))
+    app.add_handler(CommandHandler("eurusd", cmd_eurusd))
+    app.add_handler(CommandHandler("gbpusd", cmd_gbpusd))
+    app.add_handler(CommandHandler("btcusd", cmd_btcusd))
     app.add_handler(CommandHandler("analyze_xauusd", cmd_xauusd))
     app.add_handler(CommandHandler("analyze_eurusd", cmd_eurusd))
     app.add_handler(CommandHandler("analyze_gbpusd", cmd_gbpusd))
