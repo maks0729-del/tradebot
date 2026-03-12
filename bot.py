@@ -37,7 +37,11 @@ TIMEFRAMES = {
     "H4":  {"interval": "4h",      "count": 60},
     "H1":  {"interval": "1h",      "count": 100},
     "M15": {"interval": "15min",   "count": 96},
+    "M5":  {"interval": "5min",    "count": 60},
 }
+
+# 5M only for forex and gold (BTC is too noisy on 5M)
+TIMEFRAMES_NO_5M = ["BTC_USD"]
 
 
 def is_killzone():
@@ -94,6 +98,10 @@ async def fetch_candles(instrument, api_key):
     result = {}
     async with aiohttp.ClientSession() as session:
         for tf_label, tf_cfg in TIMEFRAMES.items():
+            # Skip 5M for BTC - too noisy
+            if tf_label == "M5" and instrument in TIMEFRAMES_NO_5M:
+                result[tf_label] = []
+                continue
             try:
                 candles = await fetch_twelvedata(session, api_key, symbol, tf_cfg["interval"], tf_cfg["count"])
                 result[tf_label] = candles
@@ -130,6 +138,77 @@ def find_swing_highs_lows(candles, lookback=3):
            all(c["l"] <= candles[i+j]["l"] for j in range(1, lookback+1)):
             lows.append({"price": c["l"], "index": i, "time": c["time"]})
     return {"highs": highs[-5:], "lows": lows[-5:]}
+
+
+def detect_5m_trigger(candles_5m, bias):
+    """Detect BOS/CHoCH on 5M as entry trigger in direction of bias."""
+    if not candles_5m or len(candles_5m) < 10:
+        return {"trigger": None, "desc": "немає даних"}
+
+    structure = detect_market_structure(candles_5m)
+    trend = structure.get("trend", "unknown")
+    last_bos = structure.get("last_bos")
+    last_choch = structure.get("last_choch")
+
+    # Bullish bias — look for bullish BOS or CHoCH on 5M
+    if bias == "bullish":
+        if last_choch and "bullish" in last_choch.get("type", ""):
+            return {
+                "trigger": "bullish_choch",
+                "level": last_choch["level"],
+                "desc": "✅ CHoCH вгору на 5M — тригер підтверджено",
+                "confirmed": True
+            }
+        if last_bos and "bullish" in last_bos.get("type", ""):
+            return {
+                "trigger": "bullish_bos",
+                "level": last_bos["level"],
+                "desc": "✅ BOS вгору на 5M — тригер підтверджено",
+                "confirmed": True
+            }
+        if trend == "bullish":
+            return {
+                "trigger": "bullish_structure",
+                "level": None,
+                "desc": "⏳ 5M структура бичача — чекай CHoCH для входу",
+                "confirmed": False
+            }
+        return {
+            "trigger": None,
+            "desc": "❌ 5M ще не підтвердив bullish — не входити",
+            "confirmed": False
+        }
+
+    # Bearish bias — look for bearish BOS or CHoCH on 5M
+    elif bias == "bearish":
+        if last_choch and "bearish" in last_choch.get("type", ""):
+            return {
+                "trigger": "bearish_choch",
+                "level": last_choch["level"],
+                "desc": "✅ CHoCH вниз на 5M — тригер підтверджено",
+                "confirmed": True
+            }
+        if last_bos and "bearish" in last_bos.get("type", ""):
+            return {
+                "trigger": "bearish_bos",
+                "level": last_bos["level"],
+                "desc": "✅ BOS вниз на 5M — тригер підтверджено",
+                "confirmed": True
+            }
+        if trend == "bearish":
+            return {
+                "trigger": "bearish_structure",
+                "level": None,
+                "desc": "⏳ 5M структура ведмежа — чекай CHoCH для входу",
+                "confirmed": False
+            }
+        return {
+            "trigger": None,
+            "desc": "❌ 5M ще не підтвердив bearish — не входити",
+            "confirmed": False
+        }
+
+    return {"trigger": None, "desc": "⏳ Bias не визначено — чекай", "confirmed": False}
 
 
 def detect_market_structure(candles):
@@ -299,7 +378,7 @@ def get_key_levels(candles_by_tf):
 
 def analyze_smc(candles_by_tf):
     result = {}
-    for tf in ["M", "W", "D", "H4", "H1", "M15"]:
+    for tf in ["M", "W", "D", "H4", "H1", "M15", "M5"]:
         c = candles_by_tf.get(tf, [])
         if c:
             result["structure_" + tf] = detect_market_structure(c)
@@ -326,6 +405,17 @@ def analyze_smc(candles_by_tf):
     result["setup_quality"] = score
     result["has_setup"] = score >= 3
     result["fibonacci"] = calculate_fibonacci(candles_by_tf.get("H1", []))
+
+    # 5M trigger (only for forex and gold)
+    bias_1h = result.get("structure_H1", {}).get("trend", "unknown")
+    candles_5m = candles_by_tf.get("M5", [])
+    result["trigger_5m"] = detect_5m_trigger(candles_5m, bias_1h)
+
+    # Boost score if 5M confirms
+    if result["trigger_5m"].get("confirmed"):
+        result["setup_quality"] = min(result["setup_quality"] + 1, 5)
+        result["has_setup"] = result["setup_quality"] >= 3
+
     return result
 
 
@@ -598,6 +688,8 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "=== PREMIUM/DISCOUNT ===\n"
         "4H: " + pd_str(smc_data.get("pd_zone_H4", {})) + "\n"
         "1H: " + pd_str(smc_data.get("pd_zone_H1", {})) + "\n\n"
+        "=== 5M ТРИГЕР ===\n"
+        + smc_data.get("trigger_5m", {}).get("desc", "немає даних") + "\n\n"
         "SCORE: " + str(smc_data.get("setup_quality", 0)) + "/5\n\n"
         "ПРАВИЛА: RR мін 1:2, ціль 1:3+, ризик 0.5-1%, prop challenge +8%\n\n"
         "=== РОЗРАХОВАНІ РІВНІ (використовуй ТІЛЬКИ ЦІ цифри!) ===\n"
