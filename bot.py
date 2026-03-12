@@ -275,23 +275,57 @@ def find_fvg(candles):
         nxt = candles[i + 1]
         if nxt["l"] > prev["h"]:
             fvgs.append({"type": "bullish_fvg", "top": nxt["l"], "bottom": prev["h"],
-                         "mid": (nxt["l"] + prev["h"]) / 2, "filled": False})
+                         "mid": (nxt["l"] + prev["h"]) / 2, "filled": False, "inverted": False})
         elif nxt["h"] < prev["l"]:
             fvgs.append({"type": "bearish_fvg", "top": prev["l"], "bottom": nxt["h"],
-                         "mid": (prev["l"] + nxt["h"]) / 2, "filled": False})
+                         "mid": (prev["l"] + nxt["h"]) / 2, "filled": False, "inverted": False})
+
     last_low = candles[-1]["l"] if candles else 0
     last_high = candles[-1]["h"] if candles else 0
     last_close = candles[-1]["c"] if candles else 0
+
     for fvg in fvgs:
         if fvg["type"] == "bullish_fvg":
             if last_close < fvg["bottom"]:
+                # Full fill — invert to bearish IFVG
                 fvg["filled"] = True
+                fvg["inverted"] = True
+                fvg["type"] = "bearish_ifvg"
             fvg["partial"] = last_low < fvg["top"] and last_close > fvg["bottom"]
         elif fvg["type"] == "bearish_fvg":
             if last_close > fvg["top"]:
+                # Full fill — invert to bullish IFVG
                 fvg["filled"] = True
+                fvg["inverted"] = True
+                fvg["type"] = "bullish_ifvg"
             fvg["partial"] = last_high > fvg["bottom"] and last_close < fvg["top"]
-    return [f for f in fvgs if not f["filled"]][-4:]
+
+    # Keep unfilled FVGs + inverted FVGs (IFVG) — remove only plain filled
+    active = [f for f in fvgs if not f["filled"] or f["inverted"]]
+    return active[-6:]
+
+
+def find_bpr(candles):
+    """Find Balanced Price Range — overlap between bullish and bearish FVG."""
+    fvgs = find_fvg(candles)
+    bullish = [f for f in fvgs if f["type"] == "bullish_fvg"]
+    bearish = [f for f in fvgs if f["type"] == "bearish_fvg"]
+    bprs = []
+    for b in bullish:
+        for bear in bearish:
+            # Check overlap
+            overlap_top = min(b["top"], bear["top"])
+            overlap_bottom = max(b["bottom"], bear["bottom"])
+            if overlap_top > overlap_bottom:
+                mid = (overlap_top + overlap_bottom) / 2
+                bprs.append({
+                    "type": "bpr",
+                    "top": round(overlap_top, 5),
+                    "bottom": round(overlap_bottom, 5),
+                    "mid": round(mid, 5),
+                    "size": round(overlap_top - overlap_bottom, 5),
+                })
+    return bprs[-3:]
 
 
 def find_liquidity_levels(candles):
@@ -444,6 +478,7 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
             result["structure_" + tf] = detect_market_structure(c)
             result["ob_" + tf] = find_order_blocks(c, result["structure_" + tf])
             result["fvg_" + tf] = find_fvg(c)
+            result["bpr_" + tf] = find_bpr(c)
             result["liquidity_" + tf] = find_liquidity_levels(c)
             result["sweep_" + tf] = detect_liquidity_sweep(c, result["liquidity_" + tf])
             result["pd_zone_" + tf] = get_premium_discount(c)
@@ -464,6 +499,7 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
         score += 1
     result["setup_quality"] = score
     result["has_setup"] = score >= 3
+    # Will be boosted after setups calculated if confluence found
     result["fibonacci"] = calculate_fibonacci(candles_by_tf.get("H1", []))
 
     # EQH/EQL on 1H and 4H
@@ -480,6 +516,18 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
 
     # Boost score if 5M confirms
     if result["trigger_5m"].get("confirmed"):
+        result["setup_quality"] = min(result["setup_quality"] + 1, 5)
+        result["has_setup"] = result["setup_quality"] >= 3
+
+    # Structure confirmation — continuation vs reversal
+    candles_h1 = candles_by_tf.get("H1", [])
+    candles_m15 = candles_by_tf.get("M15", [])
+    candles_h4 = candles_by_tf.get("H4", [])
+    struct_confirm = analyze_structure_confirmation(candles_h1, candles_m15, candles_h4, result)
+    result["struct_confirm"] = struct_confirm
+
+    # Boost score for high confidence confirmation
+    if struct_confirm["confidence"] >= 4:
         result["setup_quality"] = min(result["setup_quality"] + 1, 5)
         result["has_setup"] = result["setup_quality"] >= 3
 
@@ -521,6 +569,171 @@ def calc_rr(entry, sl, tp):
     return round(reward / risk, 1)
 
 
+def check_body_close(candle, level, direction):
+    """True if candle BODY closed beyond level (not just wick)."""
+    body_top = max(candle["o"], candle["c"])
+    body_bottom = min(candle["o"], candle["c"])
+    if direction == "below":
+        return body_top < level
+    else:
+        return body_bottom > level
+
+
+def analyze_structure_confirmation(candles_h1, candles_m15, candles_h4, smc_data):
+    """
+    Determines continuation vs reversal based on body close vs wick sweep.
+    CONTINUATION: body close beyond swing high/low + FVG + unswept pools
+    REVERSAL: wick sweep only + body held + pools in opposite direction
+    """
+    result = {
+        "scenario": "neutral", "direction": None,
+        "entry_type": None, "correction_zone": None,
+        "has_unswept_pools": False, "confidence": 0,
+    }
+    if not candles_h1 or len(candles_h1) < 5:
+        return result
+
+    last = candles_h1[-1]
+    prev = candles_h1[-2]
+    price = smc_data.get("current_price", 0)
+    structure_h1 = smc_data.get("structure_H1", {})
+    swing_highs = structure_h1.get("swing_highs", [])
+    swing_lows = structure_h1.get("swing_lows", [])
+    if not swing_lows or not swing_highs:
+        return result
+
+    prev_low = swing_lows[-1]["price"]
+    prev_high = swing_highs[-1]["price"]
+    fvg_h1 = smc_data.get("fvg_H1", [])
+    bpr_h1 = smc_data.get("bpr_H1", [])
+    liq_h1 = smc_data.get("liquidity_H1", {})
+    liq_h4 = smc_data.get("liquidity_H4", {})
+    pools_below = [l for l in liq_h1.get("buy_side", []) if l["price"] < price]
+    pools_below += [l for l in liq_h4.get("buy_side", []) if l["price"] < price]
+    pools_above = [l for l in liq_h1.get("sell_side", []) if l["price"] > price]
+    pools_above += [l for l in liq_h4.get("sell_side", []) if l["price"] > price]
+
+    # ── BEARISH CONTINUATION ──
+    body_broke_low = check_body_close(last, prev_low, "below") or check_body_close(prev, prev_low, "below")
+    zones_above = [f for f in fvg_h1 if f["type"] in ("bearish_fvg", "bearish_ifvg", "bullish_ifvg") and f["top"] > price]
+    zones_above += [b for b in bpr_h1 if b["mid"] > price]
+    if body_broke_low and zones_above and pools_below:
+        cz_list = []
+        for f in [z for z in zones_above if "fvg" in z.get("type","")]:
+            cz_list.append((f["type"], f["bottom"], f["top"], f["mid"]))
+        for b in [z for z in zones_above if "mid" in z]:
+            cz_list.append(("bpr", b["bottom"], b["top"], b["mid"]))
+        cz_list.sort(key=lambda x: x[1])
+        result.update({"scenario": "continuation", "direction": "sell", "entry_type": "correction",
+                       "correction_zone": cz_list[0] if cz_list else None,
+                       "has_unswept_pools": True, "confidence": 4 if len(pools_below) >= 2 else 3})
+        return result
+
+    # ── BEARISH REVERSAL → potential BUY ──
+    if last["l"] < prev_low and check_body_close(last, prev_low, "above") and pools_above:
+        result.update({"scenario": "reversal", "direction": "buy", "entry_type": "choch",
+                       "has_unswept_pools": True, "confidence": 4})
+        return result
+
+    # ── BULLISH CONTINUATION ──
+    body_broke_high = check_body_close(last, prev_high, "above") or check_body_close(prev, prev_high, "above")
+    zones_below = [f for f in fvg_h1 if f["type"] in ("bullish_fvg", "bullish_ifvg", "bearish_ifvg") and f["bottom"] < price]
+    zones_below += [b for b in bpr_h1 if b["mid"] < price]
+    if body_broke_high and zones_below and pools_above:
+        cz_list = []
+        for f in [z for z in zones_below if "fvg" in z.get("type","")]:
+            cz_list.append((f["type"], f["bottom"], f["top"], f["mid"]))
+        for b in [z for z in zones_below if "mid" in z]:
+            cz_list.append(("bpr", b["bottom"], b["top"], b["mid"]))
+        cz_list.sort(key=lambda x: x[2], reverse=True)
+        result.update({"scenario": "continuation", "direction": "buy", "entry_type": "correction",
+                       "correction_zone": cz_list[0] if cz_list else None,
+                       "has_unswept_pools": True, "confidence": 4 if len(pools_above) >= 2 else 3})
+        return result
+
+    # ── BULLISH REVERSAL → potential SELL ──
+    if last["h"] > prev_high and check_body_close(last, prev_high, "below") and pools_below:
+        result.update({"scenario": "reversal", "direction": "sell", "entry_type": "choch",
+                       "has_unswept_pools": True, "confidence": 4})
+        return result
+
+    return result
+
+
+def find_entry_zone(ob_list, fvg_list, bpr_list, price, direction):
+    """
+    Confluence-based entry zone hierarchy:
+    1. OB + FVG confluence ★★★★★
+    2. OB + IFVG confluence ★★★★☆
+    3. BPR ★★★★☆
+    4. OB alone ★★★☆☆
+    5. FVG alone ★★☆☆☆
+    6. IFVG alone ★★☆☆☆
+    """
+    if direction == "buy":
+        obs = [o for o in ob_list if o["type"] == "bullish_ob" and o["bottom"] < price]
+        fvgs = [f for f in fvg_list if f["type"] == "bullish_fvg" and f["bottom"] < price]
+        ifvgs = [f for f in fvg_list if f["type"] == "bullish_ifvg" and f["bottom"] < price]
+        bprs = [b for b in bpr_list if b["mid"] < price]
+    else:
+        obs = [o for o in ob_list if o["type"] == "bearish_ob" and o["top"] > price]
+        fvgs = [f for f in fvg_list if f["type"] == "bearish_fvg" and f["top"] > price]
+        ifvgs = [f for f in fvg_list if f["type"] == "bearish_ifvg" and f["top"] > price]
+        bprs = [b for b in bpr_list if b["mid"] > price]
+
+    best = None
+
+    # 1. OB + FVG confluence
+    for ob in obs:
+        for fvg in fvgs:
+            ot = min(ob["top"], fvg["top"])
+            ob_ = max(ob["bottom"], fvg["bottom"])
+            if ot > ob_:
+                mid = (ot + ob_) / 2
+                best = (round(mid, 5), round(ob_, 5), round(ot, 5), "OB+FVG confluence", 5)
+                break
+        if best:
+            break
+
+    # 2. OB + IFVG confluence
+    if not best:
+        for ob in obs:
+            for ifvg in ifvgs:
+                ot = min(ob["top"], ifvg["top"])
+                ob_ = max(ob["bottom"], ifvg["bottom"])
+                if ot > ob_:
+                    mid = (ot + ob_) / 2
+                    best = (round(mid, 5), round(ob_, 5), round(ot, 5), "OB+IFVG confluence", 4)
+                    break
+            if best:
+                break
+
+    # 3. BPR
+    if not best and bprs:
+        b = bprs[-1] if direction == "buy" else bprs[0]
+        best = (round(b["mid"], 5), round(b["bottom"], 5), round(b["top"], 5), "BPR", 4)
+
+    # 4. OB alone
+    if not best and obs:
+        ob = obs[-1] if direction == "buy" else obs[0]
+        entry = round(ob["top"], 5) if direction == "buy" else round(ob["bottom"], 5)
+        best = (entry, round(ob["bottom"], 5), round(ob["top"], 5), "Order Block", 3)
+
+    # 5. FVG alone
+    if not best and fvgs:
+        fvg = fvgs[-1] if direction == "buy" else fvgs[0]
+        entry = round(fvg["top"], 5) if direction == "buy" else round(fvg["bottom"], 5)
+        best = (entry, round(fvg["bottom"], 5), round(fvg["top"], 5), "FVG", 2)
+
+    # 6. IFVG alone
+    if not best and ifvgs:
+        ifvg = ifvgs[-1] if direction == "buy" else ifvgs[0]
+        entry = round(ifvg["top"], 5) if direction == "buy" else round(ifvg["bottom"], 5)
+        best = (entry, round(ifvg["bottom"], 5), round(ifvg["top"], 5), "IFVG", 2)
+
+    return best
+
+
 def calculate_setups(instrument, smc_data):
     price = smc_data.get("current_price", 0)
     key = smc_data.get("key_levels", {})
@@ -532,18 +745,34 @@ def calculate_setups(instrument, smc_data):
     swing_lows_h1 = structure_h1.get("swing_lows", [])
     swing_highs_m15 = structure_m15.get("swing_highs", [])
     swing_lows_m15 = structure_m15.get("swing_lows", [])
+    bpr_h1 = smc_data.get("bpr_H1", [])
     buf = sl_buffer(instrument)
     setups = {}
 
+    struct_confirm = smc_data.get("struct_confirm", {})
+    sc_scenario = struct_confirm.get("scenario", "neutral")
+    sc_direction = struct_confirm.get("direction")
+
     # ── BUY SETUP ──
-    buy_obs = [o for o in ob_h1 if o["type"] == "bullish_ob" and o["bottom"] < price]
-    buy_fvgs = [f for f in fvg_h1 if f["type"] == "bullish_fvg" and f["bottom"] < price]
+    buy_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "buy")
+
+    # Continuation BUY — override with correction zone below price
+    if sc_scenario == "continuation" and sc_direction == "buy":
+        cz = struct_confirm.get("correction_zone")
+        if cz:
+            buy_zone = (round(cz[3], 5), round(cz[1], 5), round(cz[2], 5), "Correction " + cz[0].upper(), 5)
+
+    # Skip buy if bearish continuation confirmed
+    if sc_scenario == "continuation" and sc_direction == "sell":
+        buy_zone = None
+
     buy_entry = None
     buy_sl = None
+    buy_label = ""
+    buy_strength = 0
 
-    if buy_obs:
-        ob = buy_obs[-1]
-        buy_entry = round(ob["top"], 5)
+    if buy_zone:
+        buy_entry, zone_bottom, zone_top, buy_label, buy_strength = buy_zone
         lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
         if lows_below:
             buy_sl = round(min(lows_below) - buf, 5)
@@ -552,15 +781,7 @@ def calculate_setups(instrument, smc_data):
             if lows_h1_below:
                 buy_sl = round(min(lows_h1_below) - buf, 5)
             else:
-                buy_sl = round(ob["bottom"] - buf, 5)
-    elif buy_fvgs:
-        fvg = buy_fvgs[-1]
-        buy_entry = round(fvg["top"], 5)
-        lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
-        if lows_below:
-            buy_sl = round(min(lows_below) - buf, 5)
-        else:
-            buy_sl = round(fvg["bottom"] - buf, 5)
+                buy_sl = round(zone_bottom - buf, 5)
 
     # ── LIQUIDITY TARGETS ──
     # Collect all potential TP targets sorted by distance from entry
@@ -634,6 +855,7 @@ def calculate_setups(instrument, smc_data):
             "entry": buy_entry, "sl": buy_sl,
             "tp1": buy_tp1, "tp2": buy_tp2,
             "tp1_label": buy_tp1_label, "tp2_label": buy_tp2_label,
+            "zone_label": buy_label, "zone_strength": buy_strength,
             "sl_pips": pips(buy_entry - buy_sl, instrument),
             "tp1_pips": pips(buy_tp1 - buy_entry, instrument),
             "tp2_pips": pips(buy_tp2 - buy_entry, instrument),
@@ -642,14 +864,23 @@ def calculate_setups(instrument, smc_data):
         }
 
     # ── SELL SETUP ──
-    sell_obs = [o for o in ob_h1 if o["type"] == "bearish_ob" and o["top"] > price]
-    sell_fvgs = [f for f in fvg_h1 if f["type"] == "bearish_fvg" and f["top"] > price]
+    sell_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "sell")
+
+    # Override: if continuation SELL — enter from correction zone above price
+    if sc_scenario == "continuation" and sc_direction == "sell":
+        cz = struct_confirm.get("correction_zone")
+        if cz:
+            sell_zone = (round(cz[3], 5), round(cz[1], 5), round(cz[2], 5), "Correction " + cz[0].upper(), 5)
+
+    # Skip sell if continuation is in buy direction
+    if sc_scenario == "continuation" and sc_direction == "buy":
+        sell_zone = None
+
     sell_entry = None
     sell_sl = None
 
-    if sell_obs:
-        ob = sell_obs[0]
-        sell_entry = round(ob["bottom"], 5)
+    if sell_zone:
+        sell_entry, zone_bottom, zone_top, sell_label, sell_strength = sell_zone
         highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
         if highs_above:
             sell_sl = round(max(highs_above) + buf, 5)
@@ -658,15 +889,7 @@ def calculate_setups(instrument, smc_data):
             if highs_h1_above:
                 sell_sl = round(max(highs_h1_above) + buf, 5)
             else:
-                sell_sl = round(ob["top"] + buf, 5)
-    elif sell_fvgs:
-        fvg = sell_fvgs[0]
-        sell_entry = round(fvg["bottom"], 5)
-        highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
-        if highs_above:
-            sell_sl = round(max(highs_above) + buf, 5)
-        else:
-            sell_sl = round(fvg["top"] + buf, 5)
+                sell_sl = round(zone_top + buf, 5)
 
     if sell_entry and sell_sl:
         risk = abs(sell_entry - sell_sl)
@@ -687,10 +910,17 @@ def calculate_setups(instrument, smc_data):
             if lvl["price"] < sell_entry:
                 sell_targets.append(("BSL 4H", round(lvl["price"], 5)))
 
-        # 3. FVG on 4H below entry
+        # 3. Bullish FVG / Bullish IFVG on 4H below entry
         for fvg in fvg_h4:
             if fvg["type"] == "bullish_fvg" and fvg["top"] < sell_entry:
                 sell_targets.append(("FVG 4H", round(fvg["top"], 5)))
+            elif fvg["type"] == "bullish_ifvg" and fvg["top"] < sell_entry:
+                sell_targets.append(("IFVG 4H", round(fvg["mid"], 5)))
+
+        # BPR on 1H below entry
+        for bpr in smc_data.get("bpr_H1", []):
+            if bpr["mid"] < sell_entry:
+                sell_targets.append(("BPR 1H", round(bpr["mid"], 5)))
 
         # 4. EQL on 1H below entry (equal lows = liquidity pool)
         for eq in eqh_eql_h1.get("eql", []):
@@ -732,6 +962,7 @@ def calculate_setups(instrument, smc_data):
             "entry": sell_entry, "sl": sell_sl,
             "tp1": sell_tp1, "tp2": sell_tp2,
             "tp1_label": sell_tp1_label, "tp2_label": sell_tp2_label,
+            "zone_label": sell_label, "zone_strength": sell_strength,
             "sl_pips": pips(sell_entry - sell_sl, instrument),
             "tp1_pips": pips(sell_entry - sell_tp1, instrument),
             "tp2_pips": pips(sell_entry - sell_tp2, instrument),
@@ -760,10 +991,14 @@ def format_setup(setup, direction, instrument=""):
     tp2_dist = format_distance(setup["tp2_pips"], instrument)
     tp1_label = setup.get("tp1_label", "")
     tp2_label = setup.get("tp2_label", "")
+    zone_label = setup.get("zone_label", "")
+    zone_strength = setup.get("zone_strength", 0)
+    stars = "★" * zone_strength + "☆" * (5 - zone_strength)
     tp1_tag = " [" + tp1_label + "]" if tp1_label else ""
     tp2_tag = " [" + tp2_label + "]" if tp2_label else ""
+    zone_tag = " | Zone: " + zone_label + " " + stars if zone_label else ""
     return (
-        arrow + " Entry: " + "{:.5f}".format(setup["entry"]) +
+        arrow + " Entry: " + "{:.5f}".format(setup["entry"]) + zone_tag +
         " | SL: " + "{:.5f}".format(setup["sl"]) + " (" + sl_dist + ")" +
         " | TP1: " + "{:.5f}".format(setup["tp1"]) + tp1_tag + " (" + tp1_dist + ", RR 1:" + str(setup["rr1"]) + ")" +
         " | TP2: " + "{:.5f}".format(setup["tp2"]) + tp2_tag + " (" + tp2_dist + ", RR 1:" + str(setup["rr2"]) + ")"
@@ -792,10 +1027,15 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         if not fvgs:
             return "  не знайдено"
         lines = []
-        for f in fvgs[-2:]:
-            d = "Bullish" if "bullish" in f["type"] else "Bearish"
-            status = " [PARTIAL FILL]" if f.get("partial") else " [FRESH]"
-            lines.append("  " + d + " FVG" + status + ": " + "{:.5f}".format(f["bottom"]) + " - " + "{:.5f}".format(f["top"]))
+        for f in fvgs[-3:]:
+            t = f["type"]
+            if "ifvg" in t:
+                d = "🔄 Bullish IFVG" if "bullish" in t else "🔄 Bearish IFVG"
+                status = ""
+            else:
+                d = "Bullish FVG" if "bullish" in t else "Bearish FVG"
+                status = " [PARTIAL]" if f.get("partial") else " [FRESH]"
+            lines.append("  " + d + status + ": " + "{:.5f}".format(f["bottom"]) + " - " + "{:.5f}".format(f["top"]))
         return "\n".join(lines)
 
     def liq_str(liq):
@@ -845,10 +1085,12 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "4H:\n" + ob_str(smc_data.get("ob_H4", [])) + "\n"
         "1H:\n" + ob_str(smc_data.get("ob_H1", [])) + "\n"
         "15M:\n" + ob_str(smc_data.get("ob_M15", [])) + "\n\n"
-        "=== FVG ===\n"
+        "=== FVG / IFVG ===\n"
         "4H:\n" + fvg_str(smc_data.get("fvg_H4", [])) + "\n"
         "1H:\n" + fvg_str(smc_data.get("fvg_H1", [])) + "\n"
         "15M:\n" + fvg_str(smc_data.get("fvg_M15", [])) + "\n\n"
+        "=== BPR (Balanced Price Range) ===\n"
+        + ("\n".join("  BPR: {:.5f} - {:.5f} | mid: {:.5f}".format(b["bottom"], b["top"], b["mid"]) for b in smc_data.get("bpr_H1", [])) or "  не знайдено") + "\n\n"
         "=== ЛІКВІДНІСТЬ ===\n"
         "1H:\n" + liq_str(smc_data.get("liquidity_H1", {})) + "\n"
         "15M:\n" + liq_str(smc_data.get("liquidity_M15", {})) + "\n\n"
