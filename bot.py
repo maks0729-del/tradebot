@@ -241,26 +241,89 @@ def detect_market_structure(candles):
 
 
 def find_order_blocks(candles, structure):
+    """
+    Valid OB requires:
+    1. Liquidity sweep before the move (wick beyond prev swing high/low)
+    2. Aggressive impulse FROM the OB (move >= 2x body size)
+    3. FVG formed during the impulse (gap between candles = aggression proof)
+    4. BOS after the impulse (closes beyond structure)
+    """
     obs = []
-    if len(candles) < 5:
+    if len(candles) < 6:
         return obs
-    for i in range(2, len(candles) - 2):
-        c = candles[i]
-        next_c = candles[i + 1]
-        next2_c = candles[i + 2]
+
+    swing_highs = [h["price"] for h in structure.get("swing_highs", [])]
+    swing_lows = [l["price"] for l in structure.get("swing_lows", [])]
+
+    for i in range(2, len(candles) - 3):
+        c = candles[i]           # potential OB candle
+        prev = candles[i - 1]    # candle before OB
+        next1 = candles[i + 1]   # first impulse candle
+        next2 = candles[i + 2]   # second impulse candle
+        next3 = candles[i + 3] if i + 3 < len(candles) else next2
+
         body_size = abs(c["c"] - c["o"])
         if body_size == 0:
             continue
+
+        # ── BULLISH OB ──
+        # OB candle must be bearish (last down candle before up move)
         if c["c"] < c["o"]:
-            move_up = (next2_c["h"] - c["l"]) / body_size if body_size > 0 else 0
-            if next_c["c"] > c["h"] and move_up > 1.5:
-                obs.append({"type": "bullish_ob", "top": c["o"], "bottom": c["l"],
-                            "index": i, "strength": min(move_up / 2, 3.0)})
+            # 1. Liquidity sweep: wick below recent swing low before OB
+            recent_lows = [l for l in swing_lows if l < c["l"]]
+            sweep_happened = c["l"] < prev["l"] or (recent_lows and c["l"] <= min(recent_lows) * 1.001)
+
+            # 2. Aggressive impulse: next candle closes above OB high
+            bos_confirmed = next1["c"] > c["h"]
+
+            # 3. Impulse strength: move at least 2x body size
+            impulse_size = next2["h"] - c["l"]
+            strong_impulse = (impulse_size / body_size) >= 2.0 if body_size > 0 else False
+
+            # 4. FVG formed during impulse (gap between OB candle and next2)
+            fvg_formed = next2["l"] > c["h"]  # gap = imbalance = aggression proof
+
+            if sweep_happened and bos_confirmed and strong_impulse and fvg_formed:
+                strength = min(impulse_size / body_size / 2, 3.0)
+                obs.append({
+                    "type": "bullish_ob",
+                    "top": c["o"],
+                    "bottom": c["l"],
+                    "index": i,
+                    "strength": round(strength, 2),
+                    "has_fvg": True,
+                    "swept_liquidity": True,
+                })
+
+        # ── BEARISH OB ──
+        # OB candle must be bullish (last up candle before down move)
         elif c["c"] > c["o"]:
-            move_down = (c["h"] - next2_c["l"]) / body_size if body_size > 0 else 0
-            if next_c["c"] < c["l"] and move_down > 1.5:
-                obs.append({"type": "bearish_ob", "top": c["h"], "bottom": c["o"],
-                            "index": i, "strength": min(move_down / 2, 3.0)})
+            # 1. Liquidity sweep: wick above recent swing high before OB
+            recent_highs = [h for h in swing_highs if h > c["h"]]
+            sweep_happened = c["h"] > prev["h"] or (recent_highs and c["h"] >= max(recent_highs) * 0.999)
+
+            # 2. Aggressive impulse: next candle closes below OB low
+            bos_confirmed = next1["c"] < c["l"]
+
+            # 3. Impulse strength: move at least 2x body size
+            impulse_size = c["h"] - next2["l"]
+            strong_impulse = (impulse_size / body_size) >= 2.0 if body_size > 0 else False
+
+            # 4. FVG formed during impulse (gap between OB candle and next2)
+            fvg_formed = next2["h"] < c["l"]  # gap below OB = imbalance
+
+            if sweep_happened and bos_confirmed and strong_impulse and fvg_formed:
+                strength = min(impulse_size / body_size / 2, 3.0)
+                obs.append({
+                    "type": "bearish_ob",
+                    "top": c["h"],
+                    "bottom": c["o"],
+                    "index": i,
+                    "strength": round(strength, 2),
+                    "has_fvg": True,
+                    "swept_liquidity": True,
+                })
+
     bullish_obs = [o for o in obs if o["type"] == "bullish_ob"][-2:]
     bearish_obs = [o for o in obs if o["type"] == "bearish_ob"][-2:]
     return bullish_obs + bearish_obs
