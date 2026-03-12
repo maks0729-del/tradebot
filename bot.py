@@ -337,6 +337,66 @@ def get_premium_discount(candles):
             "range_high": high, "range_low": low}
 
 
+
+def find_eqh_eql(candles, instrument, lookback=50):
+    """Find Equal Highs and Equal Lows (liquidity pools)."""
+    if len(candles) < 10:
+        return {"eqh": [], "eql": []}
+
+    # Tolerance: how close prices must be to be "equal"
+    if "BTC" in instrument:
+        tolerance = 50      # $50 for BTC
+    elif "XAU" in instrument:
+        tolerance = 0.5     # $0.50 for Gold
+    elif "JPY" in instrument:
+        tolerance = 0.05
+    else:
+        tolerance = 0.00050  # 5 pips for forex
+
+    recent = candles[-lookback:]
+    eqh = []
+    eql = []
+
+    highs = [c["h"] for c in recent]
+    lows = [c["l"] for c in recent]
+
+    # Find equal highs
+    for i in range(len(highs)):
+        matches = []
+        for j in range(i + 1, len(highs)):
+            if abs(highs[i] - highs[j]) <= tolerance:
+                matches.append(j)
+        if matches:
+            level = round(sum([highs[i]] + [highs[m] for m in matches]) / (len(matches) + 1), 5)
+            # Avoid duplicates
+            if not any(abs(e["price"] - level) <= tolerance for e in eqh):
+                eqh.append({
+                    "price": level,
+                    "count": len(matches) + 1,
+                    "strength": min(len(matches) + 1, 5)
+                })
+
+    # Find equal lows
+    for i in range(len(lows)):
+        matches = []
+        for j in range(i + 1, len(lows)):
+            if abs(lows[i] - lows[j]) <= tolerance:
+                matches.append(j)
+        if matches:
+            level = round(sum([lows[i]] + [lows[m] for m in matches]) / (len(matches) + 1), 5)
+            if not any(abs(e["price"] - level) <= tolerance for e in eql):
+                eql.append({
+                    "price": level,
+                    "count": len(matches) + 1,
+                    "strength": min(len(matches) + 1, 5)
+                })
+
+    # Sort by strength and return top 3
+    eqh = sorted(eqh, key=lambda x: x["strength"], reverse=True)[:3]
+    eql = sorted(eql, key=lambda x: x["strength"], reverse=True)[:3]
+
+    return {"eqh": eqh, "eql": eql}
+
 def calculate_fibonacci(candles):
     if len(candles) < 20:
         return {}
@@ -376,7 +436,7 @@ def get_key_levels(candles_by_tf):
     return levels
 
 
-def analyze_smc(candles_by_tf):
+def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     result = {}
     for tf in ["M", "W", "D", "H4", "H1", "M15", "M5"]:
         c = candles_by_tf.get(tf, [])
@@ -405,6 +465,13 @@ def analyze_smc(candles_by_tf):
     result["setup_quality"] = score
     result["has_setup"] = score >= 3
     result["fibonacci"] = calculate_fibonacci(candles_by_tf.get("H1", []))
+
+    # EQH/EQL on 1H and 4H
+    h1_candles = candles_by_tf.get("H1", [])
+    h4_candles = candles_by_tf.get("H4", [])
+    # instrument not available here, use generic tolerance via key
+    result["eqh_eql_H1"] = find_eqh_eql(h1_candles, instrument)
+    result["eqh_eql_H4"] = find_eqh_eql(h4_candles, instrument)
 
     # 5M trigger (only for forex and gold)
     bias_1h = result.get("structure_H1", {}).get("trend", "unknown")
@@ -500,6 +567,8 @@ def calculate_setups(instrument, smc_data):
     liq_h1 = smc_data.get("liquidity_H1", {})
     liq_h4 = smc_data.get("liquidity_H4", {})
     fvg_h4 = smc_data.get("fvg_H4", [])
+    eqh_eql_h1 = smc_data.get("eqh_eql_H1", {})
+    eqh_eql_h4 = smc_data.get("eqh_eql_H4", {})
 
     if buy_entry and buy_sl:
         risk = abs(buy_entry - buy_sl)
@@ -525,7 +594,17 @@ def calculate_setups(instrument, smc_data):
             if fvg["type"] == "bearish_fvg" and fvg["bottom"] > buy_entry:
                 buy_targets.append(("FVG 4H", round(fvg["bottom"], 5)))
 
-        # 4. Key levels above entry
+        # 4. EQH on 1H above entry (equal highs = liquidity pool)
+        for eq in eqh_eql_h1.get("eqh", []):
+            if eq["price"] > buy_entry:
+                buy_targets.append(("EQH 1H", round(eq["price"], 5)))
+
+        # 5. EQH on 4H above entry
+        for eq in eqh_eql_h4.get("eqh", []):
+            if eq["price"] > buy_entry:
+                buy_targets.append(("EQH 4H", round(eq["price"], 5)))
+
+        # 6. Key levels above entry
         for label in ["PDH", "PWH", "PMH"]:
             val = key.get(label)
             if val and val > buy_entry:
@@ -613,7 +692,17 @@ def calculate_setups(instrument, smc_data):
             if fvg["type"] == "bullish_fvg" and fvg["top"] < sell_entry:
                 sell_targets.append(("FVG 4H", round(fvg["top"], 5)))
 
-        # 4. Key levels below entry
+        # 4. EQL on 1H below entry (equal lows = liquidity pool)
+        for eq in eqh_eql_h1.get("eql", []):
+            if eq["price"] < sell_entry:
+                sell_targets.append(("EQL 1H", round(eq["price"], 5)))
+
+        # 5. EQL on 4H below entry
+        for eq in eqh_eql_h4.get("eql", []):
+            if eq["price"] < sell_entry:
+                sell_targets.append(("EQL 4H", round(eq["price"], 5)))
+
+        # 6. Key levels below entry
         for label in ["PDL", "PWL", "PML"]:
             val = key.get(label)
             if val and val < sell_entry:
@@ -763,6 +852,11 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "=== ЛІКВІДНІСТЬ ===\n"
         "1H:\n" + liq_str(smc_data.get("liquidity_H1", {})) + "\n"
         "15M:\n" + liq_str(smc_data.get("liquidity_M15", {})) + "\n\n"
+        "=== EQH / EQL (рівні хаї/лої) ===\n"
+        "1H EQH: " + ", ".join("{:.5f}({}x)".format(e["price"], e["count"]) for e in smc_data.get("eqh_eql_H1", {}).get("eqh", [])) + "\n"
+        "1H EQL: " + ", ".join("{:.5f}({}x)".format(e["price"], e["count"]) for e in smc_data.get("eqh_eql_H1", {}).get("eql", [])) + "\n"
+        "4H EQH: " + ", ".join("{:.5f}({}x)".format(e["price"], e["count"]) for e in smc_data.get("eqh_eql_H4", {}).get("eqh", [])) + "\n"
+        "4H EQL: " + ", ".join("{:.5f}({}x)".format(e["price"], e["count"]) for e in smc_data.get("eqh_eql_H4", {}).get("eql", [])) + "\n\n"
         "=== СВІПИ ===\n"
         "4H: " + sweep_str(smc_data.get("sweep_H4")) + "\n"
         "1H: " + sweep_str(smc_data.get("sweep_H1")) + "\n"
@@ -874,7 +968,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(emoji + " *" + display + "* — збираю свічки (6 TF)...", parse_mode=ParseMode.MARKDOWN)
         candles = await fetch_candles(instrument, TWELVEDATA_API_KEY)
         await msg.edit_text(emoji + " *" + display + "* — аналізую SMC структуру...", parse_mode=ParseMode.MARKDOWN)
-        smc_data = analyze_smc(candles)
+        smc_data = analyze_smc(candles, instrument)
         session_info = get_session_info()
         await msg.edit_text(emoji + " *" + display + "* — AI генерує аналіз...", parse_mode=ParseMode.MARKDOWN)
         analysis = await get_ai_analysis(instrument, smc_data, session_info)
@@ -953,7 +1047,7 @@ async def alert_loop(app):
                 for instrument in INSTRUMENTS:
                     try:
                         candles = await fetch_candles(instrument, TWELVEDATA_API_KEY)
-                        smc_data = analyze_smc(candles)
+                        smc_data = analyze_smc(candles, instrument)
                         if smc_data.get("has_setup") and smc_data.get("setup_quality", 0) >= 3:
                             current_price = smc_data.get("current_price", 0)
                             pv = pip_value(instrument)
