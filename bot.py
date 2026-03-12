@@ -1258,10 +1258,14 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session_info = get_session_info()
         await msg.edit_text(emoji + " *" + display + "* — AI генерує аналіз...", parse_mode=ParseMode.MARKDOWN)
         analysis = await get_ai_analysis(instrument, smc_data, session_info)
-        await msg.edit_text(analysis, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        try:
+            await msg.edit_text(analysis, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        except Exception:
+            clean = analysis.replace("*", "").replace("`", "").replace("_", "").replace("#", "")
+            await msg.edit_text(clean, disable_web_page_preview=True)
     except Exception as e:
         logger.error("Analysis error: " + str(e), exc_info=True)
-        await msg.edit_text("Помилка аналізу " + display + ":\n`" + str(e)[:200] + "`", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text("Помилка аналізу " + display + ":\n" + str(e)[:200])
 
 
 async def cmd_xauusd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1348,12 +1352,20 @@ async def alert_loop(app):
                             sent_ok = False
                             for chat_id in list(ALERT_USERS):
                                 try:
-                                    await app.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=analysis,
-                                        parse_mode=ParseMode.MARKDOWN,
-                                        disable_web_page_preview=True
-                                    )
+                                    try:
+                                        await app.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=analysis,
+                                            parse_mode=ParseMode.MARKDOWN,
+                                            disable_web_page_preview=True
+                                        )
+                                    except Exception:
+                                        clean = analysis.replace("*", "").replace("`", "").replace("_", "").replace("#", "")
+                                        await app.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=clean,
+                                            disable_web_page_preview=True
+                                        )
                                     sent_ok = True
                                 except Exception as e:
                                     logger.error("Alert send error: " + str(e))
