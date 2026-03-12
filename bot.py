@@ -476,8 +476,24 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
         c = candles_by_tf.get(tf, [])
         if c:
             result["structure_" + tf] = detect_market_structure(c)
-            result["ob_" + tf] = find_order_blocks(c, result["structure_" + tf])
-            result["fvg_" + tf] = find_fvg(c)
+
+            # Filter OB by minimum size
+            raw_obs = find_order_blocks(c, result["structure_" + tf])
+            min_ob = min_ob_size(instrument, tf)
+            pv = pip_value(instrument)
+            if "BTC" in instrument or "XAU" in instrument:
+                result["ob_" + tf] = [o for o in raw_obs if (o["top"] - o["bottom"]) >= min_ob]
+            else:
+                result["ob_" + tf] = [o for o in raw_obs if (o["top"] - o["bottom"]) / pv >= min_ob]
+
+            # Filter FVG by minimum size
+            raw_fvgs = find_fvg(c)
+            min_fvg = min_fvg_size(instrument, tf)
+            if "BTC" in instrument or "XAU" in instrument:
+                result["fvg_" + tf] = [f for f in raw_fvgs if (f["top"] - f["bottom"]) >= min_fvg]
+            else:
+                result["fvg_" + tf] = [f for f in raw_fvgs if (f["top"] - f["bottom"]) / pv >= min_fvg]
+
             result["bpr_" + tf] = find_bpr(c)
             result["liquidity_" + tf] = find_liquidity_levels(c)
             result["sweep_" + tf] = detect_liquidity_sweep(c, result["liquidity_" + tf])
@@ -555,6 +571,34 @@ def sl_buffer(instrument):
         return 0.15
     return 0.00100
 
+
+
+def min_fvg_size(instrument, tf):
+    """Minimum FVG size to be considered valid."""
+    sizes = {
+        "BTC": {"M5": 80, "M15": 80, "H1": 150, "H4": 350, "D": 700, "W": 1500, "M": 1500},
+        "XAU": {"M5": 0.50, "M15": 0.50, "H1": 0.80, "H4": 2.00, "D": 4.00, "W": 8.00, "M": 8.00},
+    }
+    forex = {"M5": 2, "M15": 2, "H1": 3, "H4": 6, "D": 12, "W": 25, "M": 25}
+    if "BTC" in instrument:
+        return sizes["BTC"].get(tf, 80)
+    if "XAU" in instrument:
+        return sizes["XAU"].get(tf, 0.50)
+    return forex.get(tf, 2)
+
+
+def min_ob_size(instrument, tf):
+    """Minimum OB size to be considered valid."""
+    sizes = {
+        "BTC": {"M5": 100, "M15": 100, "H1": 200, "H4": 500, "D": 1000, "W": 2500, "M": 2500},
+        "XAU": {"M5": 0.80, "M15": 0.80, "H1": 1.20, "H4": 3.00, "D": 6.00, "W": 12.00, "M": 12.00},
+    }
+    forex = {"M5": 3, "M15": 3, "H1": 4, "H4": 8, "D": 16, "W": 32, "M": 32}
+    if "BTC" in instrument:
+        return sizes["BTC"].get(tf, 100)
+    if "XAU" in instrument:
+        return sizes["XAU"].get(tf, 0.80)
+    return forex.get(tf, 3)
 
 def pips(price_diff, instrument):
     pv = pip_value(instrument)
