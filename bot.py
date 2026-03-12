@@ -495,21 +495,66 @@ def calculate_setups(instrument, smc_data):
         else:
             buy_sl = round(fvg["bottom"] - buf, 5)
 
+    # ── LIQUIDITY TARGETS ──
+    # Collect all potential TP targets sorted by distance from entry
+    liq_h1 = smc_data.get("liquidity_H1", {})
+    liq_h4 = smc_data.get("liquidity_H4", {})
+    fvg_h4 = smc_data.get("fvg_H4", [])
+
     if buy_entry and buy_sl:
         risk = abs(buy_entry - buy_sl)
         if risk <= 0:
             risk = buf * 3
             buy_sl = round(buy_entry - risk, 5)
-        buy_tp1 = round(buy_entry + risk * 2, 5)
-        buy_tp2 = round(buy_entry + risk * 3, 5)
-        pdh = key.get("PDH")
-        pwh = key.get("PWH")
-        if pdh and buy_entry < pdh < buy_tp2:
-            buy_tp1 = round(pdh, 5)
-        if pwh and buy_entry < pwh:
-            buy_tp2 = round(pwh, 5)
+
+        # Collect BUY targets above entry (SSL = sell-side liquidity above = targets for buy)
+        buy_targets = []
+
+        # 1. SSL on 1H above entry (stops of sellers = magnet for buys)
+        for lvl in liq_h1.get("sell_side", []):
+            if lvl["price"] > buy_entry:
+                buy_targets.append(("SSL 1H", round(lvl["price"], 5)))
+
+        # 2. SSL on 4H above entry
+        for lvl in liq_h4.get("sell_side", []):
+            if lvl["price"] > buy_entry:
+                buy_targets.append(("SSL 4H", round(lvl["price"], 5)))
+
+        # 3. FVG on 4H above entry (imbalance as magnet)
+        for fvg in fvg_h4:
+            if fvg["type"] == "bearish_fvg" and fvg["bottom"] > buy_entry:
+                buy_targets.append(("FVG 4H", round(fvg["bottom"], 5)))
+
+        # 4. Key levels above entry
+        for label in ["PDH", "PWH", "PMH"]:
+            val = key.get(label)
+            if val and val > buy_entry:
+                buy_targets.append((label, round(val, 5)))
+
+        # Sort by distance (closest first)
+        buy_targets.sort(key=lambda x: x[1])
+
+        # Filter: must give at least RR 1:1.5
+        min_tp = buy_entry + risk * 1.5
+        valid_targets = [(l, p) for l, p in buy_targets if p >= min_tp]
+
+        if len(valid_targets) >= 2:
+            buy_tp1_label, buy_tp1 = valid_targets[0]
+            buy_tp2_label, buy_tp2 = valid_targets[1]
+        elif len(valid_targets) == 1:
+            buy_tp1_label, buy_tp1 = valid_targets[0]
+            buy_tp2_label = "RR 1:3"
+            buy_tp2 = round(buy_entry + risk * 3, 5)
+        else:
+            buy_tp1_label = "RR 1:2"
+            buy_tp1 = round(buy_entry + risk * 2, 5)
+            buy_tp2_label = "RR 1:3"
+            buy_tp2 = round(buy_entry + risk * 3, 5)
+
         setups["buy"] = {
-            "entry": buy_entry, "sl": buy_sl, "tp1": buy_tp1, "tp2": buy_tp2,
+            "entry": buy_entry, "sl": buy_sl,
+            "tp1": buy_tp1, "tp2": buy_tp2,
+            "tp1_label": buy_tp1_label, "tp2_label": buy_tp2_label,
             "sl_pips": pips(buy_entry - buy_sl, instrument),
             "tp1_pips": pips(buy_tp1 - buy_entry, instrument),
             "tp2_pips": pips(buy_tp2 - buy_entry, instrument),
@@ -549,16 +594,55 @@ def calculate_setups(instrument, smc_data):
         if risk <= 0:
             risk = buf * 3
             sell_sl = round(sell_entry + risk, 5)
-        sell_tp1 = round(sell_entry - risk * 2, 5)
-        sell_tp2 = round(sell_entry - risk * 3, 5)
-        pdl = key.get("PDL")
-        pwl = key.get("PWL")
-        if pdl and sell_tp2 < pdl < sell_entry:
-            sell_tp1 = round(pdl, 5)
-        if pwl and pwl < sell_entry:
-            sell_tp2 = round(pwl, 5)
+
+        # Collect SELL targets below entry (BSL = buy-side liquidity below = targets for sells)
+        sell_targets = []
+
+        # 1. BSL on 1H below entry
+        for lvl in liq_h1.get("buy_side", []):
+            if lvl["price"] < sell_entry:
+                sell_targets.append(("BSL 1H", round(lvl["price"], 5)))
+
+        # 2. BSL on 4H below entry
+        for lvl in liq_h4.get("buy_side", []):
+            if lvl["price"] < sell_entry:
+                sell_targets.append(("BSL 4H", round(lvl["price"], 5)))
+
+        # 3. FVG on 4H below entry
+        for fvg in fvg_h4:
+            if fvg["type"] == "bullish_fvg" and fvg["top"] < sell_entry:
+                sell_targets.append(("FVG 4H", round(fvg["top"], 5)))
+
+        # 4. Key levels below entry
+        for label in ["PDL", "PWL", "PML"]:
+            val = key.get(label)
+            if val and val < sell_entry:
+                sell_targets.append((label, round(val, 5)))
+
+        # Sort by distance (closest first = highest price below entry)
+        sell_targets.sort(key=lambda x: x[1], reverse=True)
+
+        # Filter: must give at least RR 1:1.5
+        min_tp = sell_entry - risk * 1.5
+        valid_targets = [(l, p) for l, p in sell_targets if p <= min_tp]
+
+        if len(valid_targets) >= 2:
+            sell_tp1_label, sell_tp1 = valid_targets[0]
+            sell_tp2_label, sell_tp2 = valid_targets[1]
+        elif len(valid_targets) == 1:
+            sell_tp1_label, sell_tp1 = valid_targets[0]
+            sell_tp2_label = "RR 1:3"
+            sell_tp2 = round(sell_entry - risk * 3, 5)
+        else:
+            sell_tp1_label = "RR 1:2"
+            sell_tp1 = round(sell_entry - risk * 2, 5)
+            sell_tp2_label = "RR 1:3"
+            sell_tp2 = round(sell_entry - risk * 3, 5)
+
         setups["sell"] = {
-            "entry": sell_entry, "sl": sell_sl, "tp1": sell_tp1, "tp2": sell_tp2,
+            "entry": sell_entry, "sl": sell_sl,
+            "tp1": sell_tp1, "tp2": sell_tp2,
+            "tp1_label": sell_tp1_label, "tp2_label": sell_tp2_label,
             "sl_pips": pips(sell_entry - sell_sl, instrument),
             "tp1_pips": pips(sell_entry - sell_tp1, instrument),
             "tp2_pips": pips(sell_entry - sell_tp2, instrument),
@@ -585,11 +669,15 @@ def format_setup(setup, direction, instrument=""):
     sl_dist = format_distance(setup["sl_pips"], instrument)
     tp1_dist = format_distance(setup["tp1_pips"], instrument)
     tp2_dist = format_distance(setup["tp2_pips"], instrument)
+    tp1_label = setup.get("tp1_label", "")
+    tp2_label = setup.get("tp2_label", "")
+    tp1_tag = " [" + tp1_label + "]" if tp1_label else ""
+    tp2_tag = " [" + tp2_label + "]" if tp2_label else ""
     return (
         arrow + " Entry: " + "{:.5f}".format(setup["entry"]) +
         " | SL: " + "{:.5f}".format(setup["sl"]) + " (" + sl_dist + ")" +
-        " | TP1: " + "{:.5f}".format(setup["tp1"]) + " (" + tp1_dist + ", RR 1:" + str(setup["rr1"]) + ")" +
-        " | TP2: " + "{:.5f}".format(setup["tp2"]) + " (" + tp2_dist + ", RR 1:" + str(setup["rr2"]) + ")"
+        " | TP1: " + "{:.5f}".format(setup["tp1"]) + tp1_tag + " (" + tp1_dist + ", RR 1:" + str(setup["rr1"]) + ")" +
+        " | TP2: " + "{:.5f}".format(setup["tp2"]) + tp2_tag + " (" + tp2_dist + ", RR 1:" + str(setup["rr2"]) + ")"
     )
 
 
