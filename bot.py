@@ -4,6 +4,7 @@ import logging
 import aiohttp
 import json
 from datetime import datetime, timezone
+import pytz
 from typing import Dict, List, Optional
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -22,6 +23,21 @@ INSTRUMENTS = ["EUR_USD", "GBP_USD", "XAU_USD", "BTC_USD"]
 ALERT_USERS = set()
 SENT_ALERTS = {}
 MIN_PRICE_CHANGE_PIPS = 20
+
+# Cache for higher timeframes to save API requests
+TF_CACHE = {}       # {instrument: {tf: candles}}
+TF_CACHE_TIME = {}  # {instrument: {tf: last_update_timestamp}}
+
+# Cache TTL per timeframe (seconds)
+TF_CACHE_TTL = {
+    "M":   86400,   # 24 hours
+    "W":   86400,   # 24 hours
+    "D":   14400,   # 4 hours
+    "H4":  3600,    # 1 hour
+    "H1":  900,     # 15 min
+    "M15": 300,     # 5 min
+    "M5":  300,     # 5 min
+}
 
 SYMBOL_MAP = {
     "EUR_USD": "EUR/USD",
@@ -43,15 +59,36 @@ TIMEFRAMES = {
 # 5M only for forex and gold (BTC is too noisy on 5M)
 TIMEFRAMES_NO_5M = ["BTC_USD"]
 
+DUBLIN_TZ = pytz.timezone("Europe/Dublin")
+NY_TZ = pytz.timezone("America/New_York")
+
+
+def get_dublin_time():
+    return datetime.now(DUBLIN_TZ)
+
+
+def is_london_open():
+    t = get_dublin_time()
+    return t.hour == 8
+
+
+def is_ny_open():
+    ny_time = datetime.now(NY_TZ)
+    return 9 <= ny_time.hour < 12
+
+
+def is_5min_period():
+    return is_london_open() or is_ny_open()
+
 
 def is_killzone():
-    hour = datetime.now(timezone.utc).hour
-    return (8 <= hour < 12) or (13 <= hour < 17)
+    t = get_dublin_time()
+    return (8 <= t.hour < 12) or is_ny_open()
 
 
 def is_asian_session():
-    hour = datetime.now(timezone.utc).hour
-    return 22 <= hour or hour < 8
+    t = get_dublin_time()
+    return 0 <= t.hour < 7
 
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
@@ -89,6 +126,49 @@ async def fetch_twelvedata(session, api_key, symbol, interval, count):
         except (KeyError, ValueError):
             continue
     return candles
+
+
+async def fetch_candles_cached(instrument, api_key, force_tf=None):
+    """
+    Fetch candles with caching for higher timeframes.
+    force_tf: list of TFs to force refresh (ignores cache)
+    """
+    import time
+    now = time.time()
+
+    if instrument not in TF_CACHE:
+        TF_CACHE[instrument] = {}
+        TF_CACHE_TIME[instrument] = {}
+
+    tfs_to_fetch = []
+    for tf in TIMEFRAMES:
+        last_update = TF_CACHE_TIME[instrument].get(tf, 0)
+        ttl = TF_CACHE_TTL.get(tf, 300)
+        is_stale = (now - last_update) > ttl
+        is_forced = force_tf and tf in force_tf
+        # Skip 5M for BTC
+        if tf == "M5" and instrument in TIMEFRAMES_NO_5M:
+            continue
+        if is_stale or is_forced or tf not in TF_CACHE[instrument]:
+            tfs_to_fetch.append(tf)
+
+    # Fetch only stale TFs
+    if tfs_to_fetch:
+        symbol = SYMBOL_MAP.get(instrument, instrument).replace("/", "")
+        async with aiohttp.ClientSession() as session:
+            for tf in tfs_to_fetch:
+                cfg = TIMEFRAMES[tf]
+                try:
+                    candles = await fetch_twelvedata(session, api_key, symbol, cfg["interval"], cfg["count"])
+                    if candles:
+                        TF_CACHE[instrument][tf] = candles
+                        TF_CACHE_TIME[instrument][tf] = now
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"Cache fetch error {instrument} {tf}: {e}")
+
+    # Return all cached candles
+    return {tf: TF_CACHE[instrument].get(tf, []) for tf in TIMEFRAMES if tf in TF_CACHE[instrument]}
 
 
 async def fetch_candles(instrument, api_key):
@@ -1318,6 +1398,20 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         candles = await fetch_candles(instrument, TWELVEDATA_API_KEY)
         await msg.edit_text(emoji + " *" + display + "* — аналізую SMC структуру...", parse_mode=ParseMode.MARKDOWN)
         smc_data = analyze_smc(candles, instrument)
+
+        # Validate price — if 0 means API returned no data
+        if not smc_data.get("current_price") or smc_data.get("current_price") == 0:
+            await msg.edit_text(
+                "⚠️ *" + display + "* — немає даних від API\n\n"
+                "Можливі причини:\n"
+                "• Вичерпано ліміт TwelveData (800/день)\n"
+                "• Ринок закритий\n"
+                "• Проблема з підключенням\n\n"
+                "Спробуй пізніше або перевір: twelvedata.com/account",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
         session_info = get_session_info()
         await msg.edit_text(emoji + " *" + display + "* — AI генерує аналіз...", parse_mode=ParseMode.MARKDOWN)
         analysis = await get_ai_analysis(instrument, smc_data, session_info)
@@ -1389,20 +1483,36 @@ async def alert_loop(app):
     while True:
         try:
             if ALERT_USERS:
+                dublin = get_dublin_time()
+
+                # Skip asian session entirely
                 if is_asian_session():
-                    logger.info("Asian session — skipping alerts")
+                    logger.info(f"Asian session ({dublin.strftime('%H:%M')} Dublin) — sleeping 15 min")
                     await asyncio.sleep(15 * 60)
                     continue
+
+                # Skip if not in any killzone
                 if not is_killzone():
-                    logger.info("Not in killzone — skipping alerts")
+                    logger.info(f"Not in killzone ({dublin.strftime('%H:%M')} Dublin) — sleeping 15 min")
                     await asyncio.sleep(15 * 60)
                     continue
+
+                # Determine scan frequency
+                high_freq = is_5min_period()
+                period_label = "5min scan" if high_freq else "15min scan"
+                logger.info(f"[{dublin.strftime('%H:%M')} Dublin] {period_label}")
+
                 for instrument in INSTRUMENTS:
                     try:
-                        candles = await fetch_candles(instrument, TWELVEDATA_API_KEY)
+                        # Use cached fetch — only refreshes stale TFs
+                        candles = await fetch_candles_cached(instrument, TWELVEDATA_API_KEY)
                         smc_data = analyze_smc(candles, instrument)
+                        current_price = smc_data.get("current_price", 0)
+                        if not current_price or current_price == 0:
+                            logger.warning("No price data for " + instrument + " — skipping")
+                            await asyncio.sleep(3)
+                            continue
                         if smc_data.get("has_setup") and smc_data.get("setup_quality", 0) >= 3:
-                            current_price = smc_data.get("current_price", 0)
                             pv = pip_value(instrument)
                             last_price = SENT_ALERTS.get(instrument, 0)
                             price_change_pips = abs(current_price - last_price) / pv if pv > 0 else 999
@@ -1438,9 +1548,18 @@ async def alert_loop(app):
                         await asyncio.sleep(3)
                     except Exception as e:
                         logger.error("Alert scan error " + instrument + ": " + str(e))
+            else:
+                await asyncio.sleep(60)
+                continue
+
         except Exception as e:
             logger.error("Alert loop error: " + str(e))
-        await asyncio.sleep(15 * 60)
+
+        # Sleep based on current period
+        if is_5min_period():
+            await asyncio.sleep(5 * 60)
+        else:
+            await asyncio.sleep(15 * 60)
 
 
 async def post_init(app):
