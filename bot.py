@@ -1508,18 +1508,31 @@ async def alert_loop(app):
                         candles = await fetch_candles_cached(instrument, TWELVEDATA_API_KEY)
                         smc_data = analyze_smc(candles, instrument)
                         current_price = smc_data.get("current_price", 0)
+                        score = smc_data.get("setup_quality", 0)
+                        logger.info(f"[ALERT SCAN] {instrument} | price={current_price} | score={score}/5")
                         if not current_price or current_price == 0:
                             logger.warning("No price data for " + instrument + " — skipping")
                             await asyncio.sleep(3)
                             continue
-                        if smc_data.get("has_setup") and smc_data.get("setup_quality", 0) >= 3:
+
+                        # Check real setups exist (entry/SL/TP)
+                        setups = calculate_setups(instrument, smc_data)
+                        has_real_setup = bool(setups.get("buy") or setups.get("sell"))
+                        logger.info(f"[ALERT SCAN] {instrument} | real_setup={has_real_setup} | setups={list(setups.keys())}")
+
+                        if score >= 3 and has_real_setup:
                             pv = pip_value(instrument)
                             last_price = SENT_ALERTS.get(instrument, 0)
                             price_change_pips = abs(current_price - last_price) / pv if pv > 0 else 999
+                            logger.info(f"[ALERT] {instrument} | price_change={round(price_change_pips)} pips | min={MIN_PRICE_CHANGE_PIPS}")
                             if price_change_pips < MIN_PRICE_CHANGE_PIPS:
                                 logger.info("Skipping " + instrument + " — price unchanged (" + str(round(price_change_pips)) + " pips)")
                                 await asyncio.sleep(3)
                                 continue
+                        else:
+                            logger.info(f"[ALERT] {instrument} — skipping (score={score}/5, real_setup={has_real_setup})")
+                            await asyncio.sleep(3)
+                            continue
                             session_info = get_session_info()
                             analysis = await get_ai_analysis(instrument, smc_data, session_info, alert_mode=True)
                             sent_ok = False
@@ -1548,18 +1561,22 @@ async def alert_loop(app):
                         await asyncio.sleep(3)
                     except Exception as e:
                         logger.error("Alert scan error " + instrument + ": " + str(e))
+
+                # Sleep based on current period
+                if is_5min_period():
+                    logger.info(f"[{get_dublin_time().strftime('%H:%M')} Dublin] Next scan in 5 min")
+                    await asyncio.sleep(5 * 60)
+                else:
+                    logger.info(f"[{get_dublin_time().strftime('%H:%M')} Dublin] Next scan in 15 min")
+                    await asyncio.sleep(15 * 60)
+
             else:
                 await asyncio.sleep(60)
                 continue
 
         except Exception as e:
             logger.error("Alert loop error: " + str(e))
-
-        # Sleep based on current period
-        if is_5min_period():
-            await asyncio.sleep(5 * 60)
-        else:
-            await asyncio.sleep(15 * 60)
+            await asyncio.sleep(60)
 
 
 async def post_init(app):
