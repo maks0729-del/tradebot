@@ -24,6 +24,8 @@ ALERT_USERS = set()
 SENT_ALERTS = {}
 MIN_PRICE_CHANGE_PIPS = 20
 
+
+
 # Cache for higher timeframes to save API requests
 TF_CACHE = {}       # {instrument: {tf: candles}}
 TF_CACHE_TIME = {}  # {instrument: {tf: last_update_timestamp}}
@@ -128,10 +130,20 @@ async def fetch_twelvedata(session, api_key, symbol, interval, count):
     return candles
 
 
-async def fetch_candles_cached(instrument, api_key, force_tf=None):
+async def fetch_candles_cached(instrument, api_key):
     """
-    Fetch candles with caching for higher timeframes.
-    force_tf: list of TFs to force refresh (ignores cache)
+    Smart fetch with caching:
+    - M, W       → fetch once per day (86400s)
+    - D, H4      → fetch once per hour (3600s)  
+    - H1         → fetch every 15min (900s)
+    - M15, M5    → fetch every cycle (always fresh)
+    
+    Per cycle actual requests:
+    - Forex/Gold: M15 + M5 + H1 = 3 requests (cached rest)
+    - BTC:        M15 + H1 = 2 requests (no 5M)
+    - On hourly boundary: +2 (D+H4 refresh)
+    - On daily boundary:  +2 (M+W refresh)
+    Total avg per cycle: 3-4 requests per instrument = 12-16 total
     """
     import time
     now = time.time()
@@ -140,21 +152,22 @@ async def fetch_candles_cached(instrument, api_key, force_tf=None):
         TF_CACHE[instrument] = {}
         TF_CACHE_TIME[instrument] = {}
 
+    symbol = SYMBOL_MAP.get(instrument, instrument).replace("/", "")
+
     tfs_to_fetch = []
     for tf in TIMEFRAMES:
-        last_update = TF_CACHE_TIME[instrument].get(tf, 0)
-        ttl = TF_CACHE_TTL.get(tf, 300)
-        is_stale = (now - last_update) > ttl
-        is_forced = force_tf and tf in force_tf
         # Skip 5M for BTC
         if tf == "M5" and instrument in TIMEFRAMES_NO_5M:
             continue
-        if is_stale or is_forced or tf not in TF_CACHE[instrument]:
+        last_update = TF_CACHE_TIME[instrument].get(tf, 0)
+        ttl = TF_CACHE_TTL.get(tf, 300)
+        is_stale = (now - last_update) > ttl
+        not_cached = tf not in TF_CACHE[instrument]
+        if is_stale or not_cached:
             tfs_to_fetch.append(tf)
 
-    # Fetch only stale TFs
     if tfs_to_fetch:
-        symbol = SYMBOL_MAP.get(instrument, instrument).replace("/", "")
+        logger.info(f"[CACHE] {instrument} fetching {tfs_to_fetch}")
         async with aiohttp.ClientSession() as session:
             for tf in tfs_to_fetch:
                 cfg = TIMEFRAMES[tf]
@@ -163,11 +176,12 @@ async def fetch_candles_cached(instrument, api_key, force_tf=None):
                     if candles:
                         TF_CACHE[instrument][tf] = candles
                         TF_CACHE_TIME[instrument][tf] = now
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     logger.warning(f"Cache fetch error {instrument} {tf}: {e}")
+    else:
+        logger.info(f"[CACHE] {instrument} — all TFs cached, 0 requests")
 
-    # Return all cached candles
     return {tf: TF_CACHE[instrument].get(tf, []) for tf in TIMEFRAMES if tf in TF_CACHE[instrument]}
 
 
@@ -188,7 +202,6 @@ async def fetch_candles(instrument, api_key):
             except Exception as e:
                 logger.error("TwelveData error " + tf_label + ": " + str(e))
                 result[tf_label] = []
-            await asyncio.sleep(0.5)
     return result
 
 
