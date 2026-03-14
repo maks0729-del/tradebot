@@ -132,21 +132,16 @@ async def fetch_twelvedata(session, api_key, symbol, interval, count):
 
 async def fetch_candles_cached(instrument, api_key):
     """
-    Smart fetch with caching:
-    - M, W       → fetch once per day (86400s)
-    - D, H4      → fetch once per hour (3600s)  
-    - H1         → fetch every 15min (900s)
-    - M15, M5    → fetch every cycle (always fresh)
-    
-    Per cycle actual requests:
-    - Forex/Gold: M15 + M5 + H1 = 3 requests (cached rest)
-    - BTC:        M15 + H1 = 2 requests (no 5M)
-    - On hourly boundary: +2 (D+H4 refresh)
-    - On daily boundary:  +2 (M+W refresh)
-    Total avg per cycle: 3-4 requests per instrument = 12-16 total
+    Smart fetch with caching.
+    TTL per TF:
+    - M, W  → 24h
+    - D, H4 → 1h
+    - H1    → 15min
+    - M15   → 5min
+    - M5    → 5min
+    Sleep 8s between requests = max 7.5/min, never exceeds TwelveData 8/min limit.
     """
     import time
-    now = time.time()
 
     if instrument not in TF_CACHE:
         TF_CACHE[instrument] = {}
@@ -156,18 +151,16 @@ async def fetch_candles_cached(instrument, api_key):
 
     tfs_to_fetch = []
     for tf in TIMEFRAMES:
-        # Skip 5M for BTC
         if tf == "M5" and instrument in TIMEFRAMES_NO_5M:
             continue
         last_update = TF_CACHE_TIME[instrument].get(tf, 0)
         ttl = TF_CACHE_TTL.get(tf, 300)
-        is_stale = (now - last_update) > ttl
-        not_cached = tf not in TF_CACHE[instrument]
-        if is_stale or not_cached:
+        # Use fresh time() for each check
+        if (time.time() - last_update) > ttl or tf not in TF_CACHE[instrument]:
             tfs_to_fetch.append(tf)
 
     if tfs_to_fetch:
-        logger.info(f"[CACHE] {instrument} fetching {tfs_to_fetch}")
+        logger.info(f"[CACHE] {instrument} fetching {tfs_to_fetch} ({len(tfs_to_fetch)} requests)")
         async with aiohttp.ClientSession() as session:
             for tf in tfs_to_fetch:
                 cfg = TIMEFRAMES[tf]
@@ -175,12 +168,12 @@ async def fetch_candles_cached(instrument, api_key):
                     candles = await fetch_twelvedata(session, api_key, symbol, cfg["interval"], cfg["count"])
                     if candles:
                         TF_CACHE[instrument][tf] = candles
-                        TF_CACHE_TIME[instrument][tf] = now
-                    await asyncio.sleep(0.5)
+                        TF_CACHE_TIME[instrument][tf] = time.time()  # fresh time after each request
+                    await asyncio.sleep(8)  # 8s between requests = max 7.5/min
                 except Exception as e:
                     logger.warning(f"Cache fetch error {instrument} {tf}: {e}")
     else:
-        logger.info(f"[CACHE] {instrument} — all TFs cached, 0 requests")
+        logger.info(f"[CACHE] {instrument} — all cached, 0 requests")
 
     return {tf: TF_CACHE[instrument].get(tf, []) for tf in TIMEFRAMES if tf in TF_CACHE[instrument]}
 
@@ -1542,10 +1535,7 @@ async def alert_loop(app):
                                 logger.info("Skipping " + instrument + " — price unchanged (" + str(round(price_change_pips)) + " pips)")
                                 await asyncio.sleep(3)
                                 continue
-                        else:
-                            logger.info(f"[ALERT] {instrument} — skipping (score={score}/5, real_setup={has_real_setup})")
-                            await asyncio.sleep(3)
-                            continue
+                            # Send alert
                             session_info = get_session_info()
                             analysis = await get_ai_analysis(instrument, smc_data, session_info, alert_mode=True)
                             sent_ok = False
@@ -1571,6 +1561,8 @@ async def alert_loop(app):
                             if sent_ok:
                                 SENT_ALERTS[instrument] = current_price
                                 logger.info("Alert sent for " + instrument + " at " + str(current_price))
+                        else:
+                            logger.info(f"[ALERT] {instrument} — skipping (score={score}/5, real_setup={has_real_setup})")
                         await asyncio.sleep(3)
                     except Exception as e:
                         logger.error("Alert scan error " + instrument + ": " + str(e))
