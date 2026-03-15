@@ -147,7 +147,7 @@ async def fetch_candles_cached(instrument, api_key):
         TF_CACHE[instrument] = {}
         TF_CACHE_TIME[instrument] = {}
 
-    symbol = SYMBOL_MAP.get(instrument, instrument).replace("/", "")
+    symbol = SYMBOL_MAP.get(instrument, instrument)  # TwelveData needs EUR/USD with slash
 
     tfs_to_fetch = []
     for tf in TIMEFRAMES:
@@ -169,9 +169,9 @@ async def fetch_candles_cached(instrument, api_key):
                     if candles:
                         TF_CACHE[instrument][tf] = candles
                         TF_CACHE_TIME[instrument][tf] = time.time()  # fresh time after each request
-                    await asyncio.sleep(8)  # 8s between requests = max 7.5/min
                 except Exception as e:
                     logger.warning(f"Cache fetch error {instrument} {tf}: {e}")
+                await asyncio.sleep(8)  # 8s between requests — OUTSIDE try/except, always executes
     else:
         logger.info(f"[CACHE] {instrument} — all cached, 0 requests")
 
@@ -1511,6 +1511,7 @@ async def alert_loop(app):
                 for instrument in INSTRUMENTS:
                     try:
                         # Use cached fetch — only refreshes stale TFs
+                        await asyncio.sleep(2)  # small pause between instruments
                         candles = await fetch_candles_cached(instrument, TWELVEDATA_API_KEY)
                         smc_data = analyze_smc(candles, instrument)
                         current_price = smc_data.get("current_price", 0)
