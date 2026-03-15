@@ -680,6 +680,18 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     result["candles_h1"] = candles_by_tf.get("H1", [])
     result["candles_h4"] = candles_by_tf.get("H4", [])
     result["candles_5m"] = candles_by_tf.get("M5", [])
+    result["candles_d"]  = candles_by_tf.get("D", [])
+
+    # ── ORIGIN LIQUIDITY ── (BSL/SSL that originated the current move)
+    result["origin_liquidity"] = find_origin_liquidity(
+        candles_by_tf.get("H1", []),
+        candles_by_tf.get("H4", []),
+        candles_by_tf.get("D", []),
+        result
+    )
+
+    # ── SIGNAL CLASSIFICATION ── reversal vs continuation
+    result["signal"] = classify_signal(result, instrument)
     # ── EQH/EQL ──
     h1_candles = candles_by_tf.get("H1", [])
     h4_candles = candles_by_tf.get("H4", [])
@@ -721,7 +733,14 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     # 4. Ліквідність знята (sweep) — ціна почала рух
     sweep_h1 = result.get("sweep_H1") or {}
     sweep_m15 = result.get("sweep_M15") or {}
-    if sweep_h1.get("swept") or sweep_m15.get("swept"):
+    sweep_h4 = result.get("sweep_H4") or {}
+    sweep_d = result.get("sweep_D") or {}
+    if sweep_h1.get("swept") or sweep_m15.get("swept") or sweep_h4.get("swept"):
+        score += 1
+
+    # 5b. Origin liquidity знайдена — підтверджує напрямок руху
+    origin = result.get("origin_liquidity") or {}
+    if origin.get("origin"):
         score += 1
 
     # 5. Premium/Discount відповідає напрямку
@@ -731,6 +750,7 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
 
     result["setup_quality"] = min(score, 5)
     result["has_setup"] = score >= 3
+    result["origin_score"] = score  # save before boosts
 
     # ── SCORE БУСТЕРИ (максимум +2) ──
     boosts = 0
@@ -753,6 +773,15 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
 
     # Буст 3: Continuation з корекцією до FVG/IFVG/BPR
     if (result.get("struct_confirm") or {}).get("scenario") == "continuation" and (result.get("struct_confirm") or {}).get("confidence", 0) >= 4:
+        boosts += 1
+
+    # Буст 4: Reversal сигнал підтверджено (wick sweep + агресія + BOS)
+    signal = result.get("signal") or {}
+    if signal.get("type") == "reversal" and signal.get("confidence", 0) >= 3:
+        boosts += 1
+
+    # Буст 5: Reversal на старшому TF (H4 або D) — сильніший сигнал
+    if signal.get("type") == "reversal" and signal.get("sl_tf") in ("H4", "D"):
         boosts += 1
 
     # Застосовуємо бустери (максимум 5/5)
@@ -1079,6 +1108,328 @@ def find_entry_zone(ob_list, fvg_list, bpr_list, price, direction):
     return best
 
 
+
+
+def find_internal_liquidity(smc_data, direction, entry_price, origin_price):
+    """
+    Find internal liquidity between entry and origin.
+    These are targets between BSL and SSL:
+    EQH/EQL, PDH/PDL, FVG mids, BPR mids
+    Only returns levels NOT already swept (still valid targets).
+    """
+    candidates = []
+    price = smc_data.get("current_price", 0)
+    key = smc_data.get("key_levels", {})
+
+    for tf in ["H1", "H4", "D"]:
+        liq = smc_data.get("liquidity_" + tf) or {}
+        sweep = smc_data.get("sweep_" + tf) or {}
+        swept_level = sweep.get("level", 0) if sweep else 0
+
+        if direction == "sell":
+            # Internal lows between entry and origin
+            for lvl in liq.get("buy_side", []):
+                p = lvl["price"]
+                # Must be below entry, above origin, NOT already swept
+                if origin_price < p < entry_price and abs(p - swept_level) > 0.0001:
+                    candidates.append({"price": round(p, 5), "label": f"BSL {tf}", "tf": tf})
+        else:
+            # Internal highs between entry and origin
+            for lvl in liq.get("sell_side", []):
+                p = lvl["price"]
+                if entry_price < p < origin_price and abs(p - swept_level) > 0.0001:
+                    candidates.append({"price": round(p, 5), "label": f"SSL {tf}", "tf": tf})
+
+    # EQH/EQL
+    for tf in ["H1", "H4"]:
+        eqh_eql = smc_data.get("eqh_eql_" + tf) or {}
+        if direction == "sell":
+            for eq in eqh_eql.get("eql", []):
+                p = eq["price"]
+                if origin_price < p < entry_price:
+                    candidates.append({"price": round(p, 5), "label": f"EQL {tf}", "tf": tf})
+        else:
+            for eq in eqh_eql.get("eqh", []):
+                p = eq["price"]
+                if entry_price < p < origin_price:
+                    candidates.append({"price": round(p, 5), "label": f"EQH {tf}", "tf": tf})
+
+    # Key levels PDH/PDL
+    if direction == "sell":
+        for lbl in ["PDL", "PWL"]:
+            val = key.get(lbl)
+            if val and origin_price < val < entry_price:
+                candidates.append({"price": round(val, 5), "label": lbl, "tf": "D"})
+    else:
+        for lbl in ["PDH", "PWH"]:
+            val = key.get(lbl)
+            if val and entry_price < val < origin_price:
+                candidates.append({"price": round(val, 5), "label": lbl, "tf": "D"})
+
+    # FVG mids on H1/H4
+    for tf in ["H1", "H4"]:
+        fvgs = smc_data.get("fvg_" + tf) or []
+        for fvg in fvgs:
+            mid = fvg.get("mid", (fvg["top"] + fvg["bottom"]) / 2)
+            if direction == "sell" and origin_price < mid < entry_price:
+                candidates.append({"price": round(mid, 5), "label": f"FVG {tf}", "tf": tf})
+            elif direction == "buy" and entry_price < mid < origin_price:
+                candidates.append({"price": round(mid, 5), "label": f"FVG {tf}", "tf": tf})
+
+    # Sort by proximity to entry
+    if direction == "sell":
+        candidates.sort(key=lambda x: x["price"], reverse=True)
+    else:
+        candidates.sort(key=lambda x: x["price"])
+
+    return candidates[:3]
+
+
+def classify_signal(smc_data, instrument):
+    """
+    Classify signal as REVERSAL or CONTINUATION.
+
+    REVERSAL (high quality):
+    - Wick sweep on H1/H4/D (body held)
+    - 2+ FVG on 5M after sweep (aggression)
+    - Small BOS on 5M
+    - Large BOS on 15M
+
+    CONTINUATION (medium quality):
+    - Sweep but weak reaction (no aggression)
+    - Price corrected to Fibo 0.5/0.618/0.705/0.79
+    - BOS on 5M or 15M in trend direction
+
+    Returns: {"type": "reversal"/"continuation"/"none",
+              "direction": "buy"/"sell",
+              "confidence": 0-5,
+              "sl_level": price,  # liquidity level for SL
+              "sl_tf": "H1"/"H4"/"D"}
+    """
+    result = {"type": "none", "direction": None, "confidence": 0,
+              "sl_level": None, "sl_tf": None}
+
+    price = smc_data.get("current_price", 0)
+    if not price:
+        return result
+
+    trigger = smc_data.get("trigger_5m") or {}
+    aggression = smc_data.get("aggression") or {}
+    struct_confirm = smc_data.get("struct_confirm") or {}
+    fib = smc_data.get("fibonacci") or {}
+
+    direction = trigger.get("direction")
+    if not direction:
+        # Use H1 trend as fallback
+        trend = (smc_data.get("structure_H1") or {}).get("trend", "")
+        direction = "buy" if trend == "bullish" else "sell" if trend == "bearish" else None
+    if not direction:
+        return result
+
+    # ── Check for wick sweep on H1/H4/D ──
+    wick_sweep_tf = None
+    sl_level = None
+    for tf in ["H1", "H4", "D"]:
+        sweep = smc_data.get("sweep_" + tf) or {}
+        if not sweep or not sweep.get("type"):
+            continue
+        structure = smc_data.get("structure_" + tf) or {}
+        highs = structure.get("swing_highs", [])
+        lows = structure.get("swing_lows", [])
+        candles = smc_data.get("candles_" + tf.lower().replace("h", "h").replace("d", "d"), [])
+
+        # Get last candle for that TF from smc_data
+        if tf == "H1":
+            candles = smc_data.get("candles_h1", [])
+        elif tf == "H4":
+            candles = smc_data.get("candles_h4", [])
+        elif tf == "D":
+            candles = smc_data.get("candles_d", [])
+
+        if not candles:
+            continue
+        last = candles[-1]
+        body_top = max(last["o"], last["c"])
+        body_bot = min(last["o"], last["c"])
+
+        if direction == "buy" and lows:
+            prev_low = lows[-1]["price"]
+            if last["l"] < prev_low and body_bot > prev_low:
+                wick_sweep_tf = tf
+                sl_level = round(prev_low, 5)
+                break
+        elif direction == "sell" and highs:
+            prev_high = highs[-1]["price"]
+            if last["h"] > prev_high and body_top < prev_high:
+                wick_sweep_tf = tf
+                sl_level = round(prev_high, 5)
+                break
+
+    # ── REVERSAL check ──
+    is_aggressive = aggression.get("aggressive", False) and aggression.get("confidence", 0) >= 2
+    has_5m_bos = trigger.get("confirmed") and trigger.get("type") in ("BOS", "BOS+15M", "CHoCH")
+    has_15m_confirm = trigger.get("type") == "BOS+15M"
+
+    if wick_sweep_tf and is_aggressive and has_5m_bos:
+        confidence = 3
+        if has_15m_confirm:
+            confidence += 1
+        if wick_sweep_tf in ("H4", "D"):
+            confidence += 1
+        result.update({
+            "type": "reversal",
+            "direction": direction,
+            "confidence": min(confidence, 5),
+            "sl_level": sl_level,
+            "sl_tf": wick_sweep_tf
+        })
+        return result
+
+    # ── CONTINUATION check ──
+    sc_scenario = struct_confirm.get("scenario", "")
+    fib_50 = fib.get("fib_0_5")
+    fib_618 = fib.get("fib_0_618")
+    fib_705 = fib.get("fib_0_705")
+    fib_79 = fib.get("fib_0_79")
+
+    at_fibo = False
+    if fib_50 and fib_79:
+        fib_low = min(fib_50, fib_618 or fib_50, fib_705 or fib_50, fib_79)
+        fib_high = max(fib_50, fib_618 or fib_50, fib_705 or fib_50, fib_79)
+        at_fibo = fib_low <= price <= fib_high
+
+    if sc_scenario == "continuation" and has_5m_bos:
+        confidence = 2
+        if at_fibo:
+            confidence += 1
+        if has_15m_confirm:
+            confidence += 1
+
+        # SL = nearest liquidity level for continuation
+        for tf in ["H1", "H4", "D"]:
+            liq = smc_data.get("liquidity_" + tf) or {}
+            if direction == "buy":
+                lows_below = [l["price"] for l in liq.get("buy_side", []) if l["price"] < price]
+                if lows_below:
+                    sl_level = round(max(lows_below), 5)
+                    result["sl_tf"] = tf
+                    break
+            else:
+                highs_above = [l["price"] for l in liq.get("sell_side", []) if l["price"] > price]
+                if highs_above:
+                    sl_level = round(min(highs_above), 5)
+                    result["sl_tf"] = tf
+                    break
+
+        result.update({
+            "type": "continuation",
+            "direction": direction,
+            "confidence": min(confidence, 5),
+            "sl_level": sl_level,
+        })
+        return result
+
+    return result
+
+def find_origin_liquidity(candles_h1, candles_h4, candles_d, smc_data):
+    """
+    Find the BSL/SSL that ORIGINATED the current move.
+    Logic: after sweep of SSL → find BSL that caused the rally to SSL
+           after sweep of BSL → find SSL that caused the drop to BSL
+    Works on H1, H4, D timeframes.
+    Returns: {"origin": price, "type": "bsl"/"ssl", "tf": "H1"/"H4"/"D", "desc": str}
+    """
+    result = {"origin": None, "type": None, "tf": None, "desc": ""}
+
+    for tf, candles in [("D", candles_d), ("H4", candles_h4), ("H1", candles_h1)]:
+        if not candles or len(candles) < 20:
+            continue
+
+        liq = smc_data.get("liquidity_" + tf) or {}
+        sweep = smc_data.get("sweep_" + tf) or {}
+        price = smc_data.get("current_price", 0)
+
+        if not sweep or not sweep.get("type"):
+            continue
+
+        buy_side = liq.get("buy_side", [])
+        sell_side = liq.get("sell_side", [])
+
+        # SSL swept → find BSL below that originated the up move
+        if sweep["type"] == "sweep_sell_side":
+            swept_level = sweep["level"]
+            # Origin = highest BSL below swept SSL
+            candidates = [l["price"] for l in buy_side if l["price"] < swept_level]
+            if candidates:
+                origin = min(candidates)  # lowest BSL = origin of the whole move up
+                result = {
+                    "origin": round(origin, 5),
+                    "type": "bsl",
+                    "tf": tf,
+                    "desc": f"BSL {tf} {origin:.5f} — утворив рух до SSL"
+                }
+                return result  # Return first match (highest TF priority)
+
+        # BSL swept → find SSL above that originated the down move
+        elif sweep["type"] == "sweep_buy_side":
+            swept_level = sweep["level"]
+            candidates = [l["price"] for l in sell_side if l["price"] > swept_level]
+            if candidates:
+                origin = max(candidates)  # highest SSL = origin of the whole move down
+                result = {
+                    "origin": round(origin, 5),
+                    "type": "ssl",
+                    "tf": tf,
+                    "desc": f"SSL {tf} {origin:.5f} — утворив рух до BSL"
+                }
+                return result
+
+    return result
+
+
+def find_intermediate_fvg(smc_data, direction, entry_price, target_price):
+    """
+    Find FVGs between entry and target — these are balance zones where
+    price may pause/react on its way to target.
+    Works on H1, H4, D timeframes.
+    Returns: list of {"price": float, "tf": str, "type": str}
+    """
+    intermediate = []
+
+    for tf in ["H1", "H4", "D"]:
+        fvgs = smc_data.get("fvg_" + tf) or []
+        for fvg in fvgs:
+            mid = fvg.get("mid", (fvg["top"] + fvg["bottom"]) / 2)
+
+            if direction == "sell":
+                # Looking for FVGs between entry (high) and target (low)
+                if target_price < mid < entry_price:
+                    intermediate.append({
+                        "price": round(mid, 5),
+                        "top": round(fvg["top"], 5),
+                        "bottom": round(fvg["bottom"], 5),
+                        "tf": tf,
+                        "type": fvg["type"]
+                    })
+            else:
+                # Looking for FVGs between entry (low) and target (high)
+                if entry_price < mid < target_price:
+                    intermediate.append({
+                        "price": round(mid, 5),
+                        "top": round(fvg["top"], 5),
+                        "bottom": round(fvg["bottom"], 5),
+                        "tf": tf,
+                        "type": fvg["type"]
+                    })
+
+    # Sort by proximity to entry
+    if direction == "sell":
+        intermediate.sort(key=lambda x: x["price"], reverse=True)
+    else:
+        intermediate.sort(key=lambda x: x["price"])
+
+    return intermediate[:3]  # max 3 intermediate zones
+
 def calculate_setups(instrument, smc_data):
     price = smc_data.get("current_price", 0)
     key = smc_data.get("key_levels", {})
@@ -1097,6 +1448,13 @@ def calculate_setups(instrument, smc_data):
     struct_confirm = smc_data.get("struct_confirm", {})
     sc_scenario = struct_confirm.get("scenario", "neutral")
     sc_direction = struct_confirm.get("direction")
+
+    # ── SIGNAL CLASSIFICATION ──
+    signal = smc_data.get("signal") or {}
+    sig_type = signal.get("type", "none")
+    sig_direction = signal.get("direction")
+    sig_sl_level = signal.get("sl_level")
+    sig_sl_tf = signal.get("sl_tf")
 
     # ── BUY SETUP ──
     buy_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "buy")
@@ -1118,15 +1476,19 @@ def calculate_setups(instrument, smc_data):
 
     if buy_zone:
         buy_entry, zone_bottom, zone_top, buy_label, buy_strength = buy_zone
-        lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
-        if lows_below:
-            buy_sl = round(min(lows_below) - buf, 5)
+        # Use signal SL (swept liquidity level) if available — more accurate
+        if sig_sl_level and sig_direction == "buy" and sig_sl_level < buy_entry:
+            buy_sl = round(sig_sl_level - buf, 5)
         else:
-            lows_h1_below = [l["price"] for l in swing_lows_h1 if l["price"] < buy_entry]
-            if lows_h1_below:
-                buy_sl = round(min(lows_h1_below) - buf, 5)
+            lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
+            if lows_below:
+                buy_sl = round(min(lows_below) - buf, 5)
             else:
-                buy_sl = round(zone_bottom - buf, 5)
+                lows_h1_below = [l["price"] for l in swing_lows_h1 if l["price"] < buy_entry]
+                if lows_h1_below:
+                    buy_sl = round(min(lows_h1_below) - buf, 5)
+                else:
+                    buy_sl = round(zone_bottom - buf, 5)
 
     # ── LIQUIDITY TARGETS ──
     # Collect all potential TP targets sorted by distance from entry
@@ -1190,7 +1552,47 @@ def calculate_setups(instrument, smc_data):
         min_tp = buy_entry + risk * 1.5
         valid_targets = [(l, p) for l, p in buy_targets if p >= min_tp]
 
-        if len(valid_targets) >= 2:
+        # Check origin liquidity as final target (TP2)
+        origin = smc_data.get("origin_liquidity") or {}
+        origin_price = origin.get("origin")
+        origin_label = origin.get("desc", "")
+
+        if origin_price and origin_price > price and sig_type in ("reversal", "continuation"):
+            # Use origin as TP2
+            buy_tp2 = round(origin_price, 5)
+            buy_tp2_label = origin_label or "Origin BSL"
+
+            # Find internal liquidity as TP1
+            internal = find_internal_liquidity(smc_data, "buy", buy_entry, buy_tp2)
+            if internal:
+                tp1_candidate = internal[0]["price"]
+                if tp1_candidate >= min_tp:
+                    buy_tp1 = round(tp1_candidate, 5)
+                    buy_tp1_label = internal[0]["label"]
+                else:
+                    buy_tp1_label = "RR 1:2"
+                    buy_tp1 = round(buy_entry + risk * 2, 5)
+            else:
+                # Fallback: intermediate FVG
+                intermediates = find_intermediate_fvg(smc_data, "buy", buy_entry, buy_tp2)
+                if intermediates and intermediates[0]["price"] >= min_tp:
+                    buy_tp1 = round(intermediates[0]["price"], 5)
+                    buy_tp1_label = f"IMB {intermediates[0]['tf']}"
+                elif valid_targets:
+                    buy_tp1_label, buy_tp1 = valid_targets[0]
+                else:
+                    buy_tp1_label = "RR 1:2"
+                    buy_tp1 = round(buy_entry + risk * 2, 5)
+
+            # Validate RR >= 2 for both TPs
+            if calc_rr(buy_entry, buy_sl, buy_tp1) < 2.0:
+                buy_tp1 = round(buy_entry + risk * 2, 5)
+                buy_tp1_label = "RR 1:2"
+            if calc_rr(buy_entry, buy_sl, buy_tp2) < 3.0:
+                buy_tp2 = round(buy_entry + risk * 3, 5)
+                buy_tp2_label = "RR 1:3"
+
+        elif len(valid_targets) >= 2:
             buy_tp1_label, buy_tp1 = valid_targets[0]
             buy_tp2_label, buy_tp2 = valid_targets[1]
         elif len(valid_targets) == 1:
@@ -1233,15 +1635,19 @@ def calculate_setups(instrument, smc_data):
 
     if sell_zone:
         sell_entry, zone_bottom, zone_top, sell_label, sell_strength = sell_zone
-        highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
-        if highs_above:
-            sell_sl = round(max(highs_above) + buf, 5)
+        # Use signal SL (swept liquidity level) if available
+        if sig_sl_level and sig_direction == "sell" and sig_sl_level > sell_entry:
+            sell_sl = round(sig_sl_level + buf, 5)
         else:
-            highs_h1_above = [h["price"] for h in swing_highs_h1 if h["price"] > sell_entry]
-            if highs_h1_above:
-                sell_sl = round(max(highs_h1_above) + buf, 5)
+            highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
+            if highs_above:
+                sell_sl = round(max(highs_above) + buf, 5)
             else:
-                sell_sl = round(zone_top + buf, 5)
+                highs_h1_above = [h["price"] for h in swing_highs_h1 if h["price"] > sell_entry]
+                if highs_h1_above:
+                    sell_sl = round(max(highs_h1_above) + buf, 5)
+                else:
+                    sell_sl = round(zone_top + buf, 5)
 
     if sell_entry and sell_sl:
         risk = abs(sell_entry - sell_sl)
@@ -1303,7 +1709,40 @@ def calculate_setups(instrument, smc_data):
         min_tp = sell_entry - risk * 1.5
         valid_targets = [(l, p) for l, p in sell_targets if p <= min_tp]
 
-        if len(valid_targets) >= 2:
+        # Check origin liquidity as final target (TP2)
+        origin = smc_data.get("origin_liquidity") or {}
+        origin_price = origin.get("origin")
+        origin_label = origin.get("desc", "")
+
+        if origin_price and origin_price < price and sig_type in ("reversal", "continuation"):
+            sell_tp2 = round(origin_price, 5)
+            sell_tp2_label = origin_label or "Origin BSL"
+
+            # Find internal liquidity as TP1
+            internal = find_internal_liquidity(smc_data, "sell", sell_entry, sell_tp2)
+            if internal and internal[0]["price"] <= min_tp:
+                sell_tp1 = round(internal[0]["price"], 5)
+                sell_tp1_label = internal[0]["label"]
+            else:
+                intermediates = find_intermediate_fvg(smc_data, "sell", sell_entry, sell_tp2)
+                if intermediates and intermediates[0]["price"] <= min_tp:
+                    sell_tp1 = round(intermediates[0]["price"], 5)
+                    sell_tp1_label = f"IMB {intermediates[0]['tf']}"
+                elif valid_targets:
+                    sell_tp1_label, sell_tp1 = valid_targets[0]
+                else:
+                    sell_tp1_label = "RR 1:2"
+                    sell_tp1 = round(sell_entry - risk * 2, 5)
+
+            # Validate RR >= 2 for TP1, >= 3 for TP2
+            if calc_rr(sell_entry, sell_sl, sell_tp1) < 2.0:
+                sell_tp1 = round(sell_entry - risk * 2, 5)
+                sell_tp1_label = "RR 1:2"
+            if calc_rr(sell_entry, sell_sl, sell_tp2) < 3.0:
+                sell_tp2 = round(sell_entry - risk * 3, 5)
+                sell_tp2_label = "RR 1:3"
+
+        elif len(valid_targets) >= 2:
             sell_tp1_label, sell_tp1 = valid_targets[0]
             sell_tp2_label, sell_tp2 = valid_targets[1]
         elif len(valid_targets) == 1:
