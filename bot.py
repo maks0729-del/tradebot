@@ -103,6 +103,19 @@ def is_asian_session():
     return 0 <= t.hour < 7
 
 
+def is_weekend():
+    """Saturday and Sunday — forex/gold markets closed."""
+    t = get_dublin_time()
+    return t.weekday() >= 5  # 5=Saturday, 6=Sunday
+
+
+def get_active_instruments():
+    """Returns active instruments based on day of week."""
+    if is_weekend():
+        return ["BTC_USD"]  # only crypto on weekends
+    return INSTRUMENTS      # all instruments on weekdays
+
+
 # ── DATA ──────────────────────────────────────────────────────────────────────
 
 async def fetch_twelvedata(session, api_key, symbol, interval, count):
@@ -1660,7 +1673,10 @@ async def alert_loop(app):
                 period_label = "5min scan" if high_freq else "15min scan"
                 logger.info(f"[{dublin.strftime('%H:%M')} Dublin] {period_label}")
 
-                for instrument in INSTRUMENTS:
+                active = get_active_instruments()
+                if is_weekend():
+                    logger.info(f"[{dublin.strftime('%H:%M')} Dublin] Weekend — forex/gold off, BTC only")
+                for instrument in active:
                     try:
                         # Use cached fetch — only refreshes stale TFs
                         await asyncio.sleep(2)  # small pause between instruments
