@@ -22,7 +22,17 @@ ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 INSTRUMENTS = ["EUR_USD", "GBP_USD", "XAU_USD", "BTC_USD"]
 ALERT_USERS = set()
 SENT_ALERTS = {}
-MIN_PRICE_CHANGE_PIPS = 20
+MIN_PRICE_CHANGE_PIPS = 20  # default for forex
+
+def min_price_change(instrument):
+    """Minimum price change before sending repeat alert."""
+    if "BTC" in instrument:
+        return 500   # $500 for BTC
+    if "XAU" in instrument:
+        return 150   # 150 * 0.01 = $1.50 for Gold
+    if "GBP" in instrument:
+        return 10    # 10 pips for GBP
+    return 8         # 8 pips for EUR
 
 
 
@@ -226,75 +236,78 @@ def find_swing_highs_lows(candles, lookback=3):
     return {"highs": highs[-5:], "lows": lows[-5:]}
 
 
-def detect_5m_trigger(candles_5m, bias):
-    """Detect BOS/CHoCH on 5M as entry trigger in direction of bias."""
-    if not candles_5m or len(candles_5m) < 10:
-        return {"trigger": None, "desc": "немає даних"}
+def detect_5m_trigger(candles_5m, bias, candles_15m=None, instrument="EUR_USD"):
+    """
+    Forex/XAU: small BOS on 5M + confirmation on 15M
+    BTC: BOS on 15M only
+    Returns trigger info with aggression score
+    """
+    result = {"confirmed": False, "type": None, "direction": None, "aggression": 0}
 
-    structure = detect_market_structure(candles_5m)
-    trend = structure.get("trend", "unknown")
-    last_bos = structure.get("last_bos")
-    last_choch = structure.get("last_choch")
+    is_btc = "BTC" in instrument
 
-    # Bullish bias — look for bullish BOS or CHoCH on 5M
-    if bias == "bullish":
-        if last_choch and "bullish" in last_choch.get("type", ""):
-            return {
-                "trigger": "bullish_choch",
-                "level": last_choch["level"],
-                "desc": "✅ CHoCH вгору на 5M — тригер підтверджено",
-                "confirmed": True
-            }
-        if last_bos and "bullish" in last_bos.get("type", ""):
-            return {
-                "trigger": "bullish_bos",
-                "level": last_bos["level"],
-                "desc": "✅ BOS вгору на 5M — тригер підтверджено",
-                "confirmed": True
-            }
-        if trend == "bullish":
-            return {
-                "trigger": "bullish_structure",
-                "level": None,
-                "desc": "⏳ 5M структура бичача — чекай CHoCH для входу",
-                "confirmed": False
-            }
-        return {
-            "trigger": None,
-            "desc": "❌ 5M ще не підтвердив bullish — не входити",
-            "confirmed": False
-        }
+    # For BTC use 15M as trigger TF
+    trigger_candles = candles_15m if is_btc else candles_5m
+    confirm_candles = candles_15m if not is_btc else None
 
-    # Bearish bias — look for bearish BOS or CHoCH on 5M
-    elif bias == "bearish":
-        if last_choch and "bearish" in last_choch.get("type", ""):
-            return {
-                "trigger": "bearish_choch",
-                "level": last_choch["level"],
-                "desc": "✅ CHoCH вниз на 5M — тригер підтверджено",
-                "confirmed": True
-            }
-        if last_bos and "bearish" in last_bos.get("type", ""):
-            return {
-                "trigger": "bearish_bos",
-                "level": last_bos["level"],
-                "desc": "✅ BOS вниз на 5M — тригер підтверджено",
-                "confirmed": True
-            }
-        if trend == "bearish":
-            return {
-                "trigger": "bearish_structure",
-                "level": None,
-                "desc": "⏳ 5M структура ведмежа — чекай CHoCH для входу",
-                "confirmed": False
-            }
-        return {
-            "trigger": None,
-            "desc": "❌ 5M ще не підтвердив bearish — не входити",
-            "confirmed": False
-        }
+    if not trigger_candles or len(trigger_candles) < 10:
+        return result
 
-    return {"trigger": None, "desc": "⏳ Bias не визначено — чекай", "confirmed": False}
+    recent = trigger_candles[-15:]
+    highs = [c["h"] for c in recent]
+    lows = [c["l"] for c in recent]
+    closes = [c["c"] for c in recent]
+
+    last = recent[-1]
+    prev_high = max(highs[:-3]) if len(highs) > 3 else highs[0]
+    prev_low = min(lows[:-3]) if len(lows) > 3 else lows[0]
+
+    # Count FVGs for aggression score
+    fvg_count = count_fvg_on_5m(trigger_candles[-20:]) if not is_btc else 0
+
+    # BOS bullish: close above recent swing high
+    if bias in ("bullish", "buy") and last["c"] > prev_high:
+        result["confirmed"] = True
+        result["type"] = "BOS"
+        result["direction"] = "buy"
+        result["aggression"] = min(fvg_count, 3)
+
+        # For forex: check 15M confirmation
+        if not is_btc and confirm_candles and len(confirm_candles) >= 5:
+            recent_15m = confirm_candles[-5:]
+            highs_15m = [c["h"] for c in recent_15m]
+            if recent_15m[-1]["c"] > max(highs_15m[:-1]):
+                result["type"] = "BOS+15M"
+                result["aggression"] = min(result["aggression"] + 1, 3)
+
+    # BOS bearish: close below recent swing low
+    elif bias in ("bearish", "sell") and last["c"] < prev_low:
+        result["confirmed"] = True
+        result["type"] = "BOS"
+        result["direction"] = "sell"
+        result["aggression"] = min(fvg_count, 3)
+
+        if not is_btc and confirm_candles and len(confirm_candles) >= 5:
+            recent_15m = confirm_candles[-5:]
+            lows_15m = [c["l"] for c in recent_15m]
+            if recent_15m[-1]["c"] < min(lows_15m[:-1]):
+                result["type"] = "BOS+15M"
+                result["aggression"] = min(result["aggression"] + 1, 3)
+
+    # CHoCH — opposite direction BOS
+    elif bias in ("bullish", "buy") and last["c"] < prev_low:
+        result["confirmed"] = True
+        result["type"] = "CHoCH"
+        result["direction"] = "sell"
+        result["aggression"] = min(fvg_count, 3)
+
+    elif bias in ("bearish", "sell") and last["c"] > prev_high:
+        result["confirmed"] = True
+        result["type"] = "CHoCH"
+        result["direction"] = "buy"
+        result["aggression"] = min(fvg_count, 3)
+
+    return result
 
 
 def detect_market_structure(candles):
@@ -649,52 +662,89 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
             result["pd_zone_" + tf] = get_premium_discount(c)
             result["current_price"] = c[-1]["c"]
     result["key_levels"] = get_key_levels(candles_by_tf)
-    score = 0
-    if result.get("structure_H1", {}).get("trend") in ("bullish", "bearish"):
-        score += 1
-    if result.get("fvg_M15"):
-        score += 1
-    if result.get("ob_H1"):
-        score += 1
-    if result.get("sweep_M15"):
-        score += 1
-    zone = result.get("pd_zone_H1", {}).get("zone", "")
-    trend = result.get("structure_H1", {}).get("trend", "")
-    if (trend == "bullish" and zone == "discount") or (trend == "bearish" and zone == "premium"):
-        score += 1
-    result["setup_quality"] = score
-    result["has_setup"] = score >= 3
-    # Will be boosted after setups calculated if confluence found
-    result["fibonacci"] = calculate_fibonacci(candles_by_tf.get("H1", []))
-
-    # EQH/EQL on 1H and 4H
+    # Store raw candles for aggression detection in calculate_setups
+    result["candles_h1"] = candles_by_tf.get("H1", [])
+    result["candles_h4"] = candles_by_tf.get("H4", [])
+    result["candles_5m"] = candles_by_tf.get("M5", [])
+    # ── EQH/EQL ──
     h1_candles = candles_by_tf.get("H1", [])
     h4_candles = candles_by_tf.get("H4", [])
-    # instrument not available here, use generic tolerance via key
     result["eqh_eql_H1"] = find_eqh_eql(h1_candles, instrument)
     result["eqh_eql_H4"] = find_eqh_eql(h4_candles, instrument)
+    result["fibonacci"] = calculate_fibonacci(h1_candles)
 
-    # 5M trigger (only for forex and gold)
+    # ── 5M/15M TRIGGER ──
     bias_1h = result.get("structure_H1", {}).get("trend", "unknown")
     candles_5m = candles_by_tf.get("M5", [])
-    result["trigger_5m"] = detect_5m_trigger(candles_5m, bias_1h)
+    candles_15m = candles_by_tf.get("M15", [])
+    result["trigger_5m"] = detect_5m_trigger(candles_5m, bias_1h, candles_15m, instrument)
 
-    # Boost score if 5M confirms
-    if result["trigger_5m"].get("confirmed"):
-        result["setup_quality"] = min(result["setup_quality"] + 1, 5)
-        result["has_setup"] = result["setup_quality"] >= 3
-
-    # Structure confirmation — continuation vs reversal
+    # ── STRUCTURE CONFIRMATION ──
     candles_h1 = candles_by_tf.get("H1", [])
     candles_m15 = candles_by_tf.get("M15", [])
     candles_h4 = candles_by_tf.get("H4", [])
     struct_confirm = analyze_structure_confirmation(candles_h1, candles_m15, candles_h4, result)
     result["struct_confirm"] = struct_confirm
 
-    # Boost score for high confidence confirmation
-    if struct_confirm["confidence"] >= 4:
-        result["setup_quality"] = min(result["setup_quality"] + 1, 5)
-        result["has_setup"] = result["setup_quality"] >= 3
+    # ── SCORE SYSTEM ──
+    # Base: market structure
+    score = 0
+    trend = result.get("structure_H1", {}).get("trend", "")
+    trend_h4 = result.get("structure_H4", {}).get("trend", "")
+
+    # 1. H1 структура визначена
+    if trend in ("bullish", "bearish"):
+        score += 1
+
+    # 2. H4 підтверджує H1 напрямок
+    if trend and trend == trend_h4:
+        score += 1
+
+    # 3. OB або FVG на H1 як зона входу
+    if result.get("ob_H1") or result.get("fvg_H1"):
+        score += 1
+
+    # 4. Ліквідність знята (sweep) — ціна почала рух
+    sweep_h1 = result.get("sweep_H1", {})
+    sweep_m15 = result.get("sweep_M15", {})
+    if sweep_h1.get("swept") or sweep_m15.get("swept"):
+        score += 1
+
+    # 5. Premium/Discount відповідає напрямку
+    zone = result.get("pd_zone_H1", {}).get("zone", "")
+    if (trend == "bullish" and zone == "discount") or (trend == "bearish" and zone == "premium"):
+        score += 1
+
+    result["setup_quality"] = min(score, 5)
+    result["has_setup"] = score >= 3
+
+    # ── SCORE БУСТЕРИ (максимум +2) ──
+    boosts = 0
+
+    # Буст 1: 5M/15M тригер підтверджує bias
+    trigger = result["trigger_5m"]
+    if trigger.get("confirmed") and trigger.get("direction") == trend:
+        boosts += 1
+        # Додатковий буст якщо BOS+15M (повне підтвердження)
+        if trigger.get("type") == "BOS+15M":
+            boosts += 1
+
+    # Буст 2: Агресія після sweep (2+ FVG на 5M або wick sweep на H1/H4)
+    aggression = detect_aggressive_reversal(
+        candles_h1, candles_h4, candles_5m, result,
+        "buy" if trend == "bullish" else "sell"
+    )
+    if aggression["aggressive"] and aggression["confidence"] >= 2:
+        boosts += 1
+
+    # Буст 3: Continuation з корекцією до FVG/IFVG/BPR
+    if struct_confirm.get("scenario") == "continuation" and struct_confirm.get("confidence", 0) >= 4:
+        boosts += 1
+
+    # Застосовуємо бустери (максимум 5/5)
+    result["setup_quality"] = min(result["setup_quality"] + boosts, 5)
+    result["has_setup"] = result["setup_quality"] >= 3
+    result["aggression"] = aggression
 
     return result
 
@@ -761,6 +811,94 @@ def calc_rr(entry, sl, tp):
         return 0
     return round(reward / risk, 1)
 
+
+
+def count_fvg_on_5m(candles_5m):
+    """Count FVGs on 5M — multiple FVGs = aggressive move."""
+    if not candles_5m or len(candles_5m) < 10:
+        return 0
+    recent = candles_5m[-20:]
+    count = 0
+    for i in range(1, len(recent) - 1):
+        prev = recent[i - 1]
+        nxt = recent[i + 1]
+        # Bullish FVG
+        if nxt["l"] > prev["h"]:
+            count += 1
+        # Bearish FVG
+        if nxt["h"] < prev["l"]:
+            count += 1
+    return count
+
+
+def detect_aggressive_reversal(candles_h1, candles_h4, candles_5m, smc_data, direction):
+    """
+    Detect aggressive reversal after liquidity sweep.
+    Signs of aggression:
+    1. Sweep by wick on 1H or 4H (body didn't close beyond pool)
+    2. Multiple FVGs on 5M during reversal move (3+ = aggressive)
+    Returns: {"aggressive": bool, "confidence": 0-3, "reason": str}
+    """
+    result = {"aggressive": False, "confidence": 0, "reason": ""}
+    score = 0
+    reasons = []
+
+    # Check 1: wick sweep on 1H (body held)
+    if candles_h1 and len(candles_h1) >= 2:
+        last = candles_h1[-1]
+        body_top = max(last["o"], last["c"])
+        body_bot = min(last["o"], last["c"])
+        structure = smc_data.get("structure_H1", {})
+        swing_highs = structure.get("swing_highs", [])
+        swing_lows = structure.get("swing_lows", [])
+
+        if direction == "sell" and swing_highs:
+            prev_high = swing_highs[-1]["price"]
+            wick_swept = last["h"] > prev_high
+            body_held = body_top < prev_high
+            if wick_swept and body_held:
+                score += 1
+                reasons.append("wick sweep 1H (тіло утримало)")
+
+        if direction == "buy" and swing_lows:
+            prev_low = swing_lows[-1]["price"]
+            wick_swept = last["l"] < prev_low
+            body_held = body_bot > prev_low
+            if wick_swept and body_held:
+                score += 1
+                reasons.append("wick sweep 1H (тіло утримало)")
+
+    # Check 2: wick sweep on 4H
+    if candles_h4 and len(candles_h4) >= 2:
+        last4 = candles_h4[-1]
+        body_top4 = max(last4["o"], last4["c"])
+        body_bot4 = min(last4["o"], last4["c"])
+        structure4 = smc_data.get("structure_H4", {})
+        highs4 = structure4.get("swing_highs", [])
+        lows4 = structure4.get("swing_lows", [])
+
+        if direction == "sell" and highs4:
+            prev_high4 = highs4[-1]["price"]
+            if last4["h"] > prev_high4 and body_top4 < prev_high4:
+                score += 1
+                reasons.append("wick sweep 4H (тіло утримало)")
+
+        if direction == "buy" and lows4:
+            prev_low4 = lows4[-1]["price"]
+            if last4["l"] < prev_low4 and body_bot4 > prev_low4:
+                score += 1
+                reasons.append("wick sweep 4H (тіло утримало)")
+
+    # Check 3: multiple FVGs on 5M = aggressive move
+    fvg_count = count_fvg_on_5m(candles_5m)
+    if fvg_count >= 2:
+        score += 1
+        reasons.append(f"агресія на 5M ({fvg_count} FVG)")
+
+    result["aggressive"] = score >= 1
+    result["confidence"] = score
+    result["reason"] = " + ".join(reasons) if reasons else "немає агресії"
+    return result
 
 def check_body_close(candle, level, direction):
     """True if candle BODY closed beyond level (not just wick)."""
@@ -990,41 +1128,48 @@ def calculate_setups(instrument, smc_data):
             risk = buf * 3
             buy_sl = round(buy_entry - risk, 5)
 
-        # Collect BUY targets above entry (SSL = sell-side liquidity above = targets for buy)
+        # Collect BUY targets — must be ABOVE current price (not just above entry)
         buy_targets = []
 
-        # 1. SSL on 1H above entry (stops of sellers = magnet for buys)
+        # Check aggressive reversal — affects TP direction
+        candles_5m_data = smc_data.get("candles_5m", [])
+        aggression = detect_aggressive_reversal(
+            smc_data.get("candles_h1", []), smc_data.get("candles_h4", []),
+            candles_5m_data, smc_data, "buy"
+        )
+
+        # 1. SSL on 1H ABOVE current price
         for lvl in liq_h1.get("sell_side", []):
-            if lvl["price"] > buy_entry:
+            if lvl["price"] > price:
                 buy_targets.append(("SSL 1H", round(lvl["price"], 5)))
 
-        # 2. SSL on 4H above entry
+        # 2. SSL on 4H ABOVE current price
         for lvl in liq_h4.get("sell_side", []):
-            if lvl["price"] > buy_entry:
+            if lvl["price"] > price:
                 buy_targets.append(("SSL 4H", round(lvl["price"], 5)))
 
-        # 3. FVG on 4H above entry (imbalance as magnet)
+        # 3. FVG on 4H above current price
         for fvg in fvg_h4:
-            if fvg["type"] == "bearish_fvg" and fvg["bottom"] > buy_entry:
+            if fvg["type"] == "bearish_fvg" and fvg["bottom"] > price:
                 buy_targets.append(("FVG 4H", round(fvg["bottom"], 5)))
 
-        # 4. EQH on 1H above entry (equal highs = liquidity pool)
+        # 4. EQH on 1H above current price
         for eq in eqh_eql_h1.get("eqh", []):
-            if eq["price"] > buy_entry:
+            if eq["price"] > price:
                 buy_targets.append(("EQH 1H", round(eq["price"], 5)))
 
-        # 5. EQH on 4H above entry
+        # 5. EQH on 4H above current price
         for eq in eqh_eql_h4.get("eqh", []):
-            if eq["price"] > buy_entry:
+            if eq["price"] > price:
                 buy_targets.append(("EQH 4H", round(eq["price"], 5)))
 
-        # 6. Key levels above entry
+        # 6. Key levels above current price
         for label in ["PDH", "PWH", "PMH"]:
             val = key.get(label)
-            if val and val > buy_entry:
+            if val and val > price:
                 buy_targets.append((label, round(val, 5)))
 
-        # Sort by distance (closest first)
+        # Sort by distance from current price (closest first)
         buy_targets.sort(key=lambda x: x[1])
 
         # Filter: must give at least RR 1:1.5
@@ -1090,48 +1235,54 @@ def calculate_setups(instrument, smc_data):
             risk = buf * 3
             sell_sl = round(sell_entry + risk, 5)
 
-        # Collect SELL targets below entry (BSL = buy-side liquidity below = targets for sells)
+        # Collect SELL targets — must be BELOW current price
         sell_targets = []
 
-        # 1. BSL on 1H below entry
+        # Check aggressive reversal
+        aggression_sell = detect_aggressive_reversal(
+            smc_data.get("candles_h1", []), smc_data.get("candles_h4", []),
+            smc_data.get("candles_5m", []), smc_data, "sell"
+        )
+
+        # 1. BSL on 1H BELOW current price
         for lvl in liq_h1.get("buy_side", []):
-            if lvl["price"] < sell_entry:
+            if lvl["price"] < price:
                 sell_targets.append(("BSL 1H", round(lvl["price"], 5)))
 
-        # 2. BSL on 4H below entry
+        # 2. BSL on 4H BELOW current price
         for lvl in liq_h4.get("buy_side", []):
-            if lvl["price"] < sell_entry:
+            if lvl["price"] < price:
                 sell_targets.append(("BSL 4H", round(lvl["price"], 5)))
 
-        # 3. Bullish FVG / Bullish IFVG on 4H below entry
+        # 3. FVG on 4H below current price
         for fvg in fvg_h4:
-            if fvg["type"] == "bullish_fvg" and fvg["top"] < sell_entry:
+            if fvg["type"] == "bullish_fvg" and fvg["top"] < price:
                 sell_targets.append(("FVG 4H", round(fvg["top"], 5)))
-            elif fvg["type"] == "bullish_ifvg" and fvg["top"] < sell_entry:
+            elif fvg["type"] == "bullish_ifvg" and fvg["top"] < price:
                 sell_targets.append(("IFVG 4H", round(fvg["mid"], 5)))
 
-        # BPR on 1H below entry
+        # BPR on 1H below current price
         for bpr in smc_data.get("bpr_H1", []):
-            if bpr["mid"] < sell_entry:
+            if bpr["mid"] < price:
                 sell_targets.append(("BPR 1H", round(bpr["mid"], 5)))
 
-        # 4. EQL on 1H below entry (equal lows = liquidity pool)
+        # 4. EQL on 1H below current price
         for eq in eqh_eql_h1.get("eql", []):
-            if eq["price"] < sell_entry:
+            if eq["price"] < price:
                 sell_targets.append(("EQL 1H", round(eq["price"], 5)))
 
-        # 5. EQL on 4H below entry
+        # 5. EQL on 4H below current price
         for eq in eqh_eql_h4.get("eql", []):
-            if eq["price"] < sell_entry:
+            if eq["price"] < price:
                 sell_targets.append(("EQL 4H", round(eq["price"], 5)))
 
-        # 6. Key levels below entry
+        # 6. Key levels below current price
         for label in ["PDL", "PWL", "PML"]:
             val = key.get(label)
-            if val and val < sell_entry:
+            if val and val < price:
                 sell_targets.append((label, round(val, 5)))
 
-        # Sort by distance (closest first = highest price below entry)
+        # Sort by distance from current price (closest first = highest below price)
         sell_targets.sort(key=lambda x: x[1], reverse=True)
 
         # Filter: must give at least RR 1:1.5
@@ -1531,9 +1682,10 @@ async def alert_loop(app):
                             pv = pip_value(instrument)
                             last_price = SENT_ALERTS.get(instrument, 0)
                             price_change_pips = abs(current_price - last_price) / pv if pv > 0 else 999
-                            logger.info(f"[ALERT] {instrument} | price_change={round(price_change_pips)} pips | min={MIN_PRICE_CHANGE_PIPS}")
-                            if price_change_pips < MIN_PRICE_CHANGE_PIPS:
-                                logger.info("Skipping " + instrument + " — price unchanged (" + str(round(price_change_pips)) + " pips)")
+                            min_change = min_price_change(instrument)
+                            logger.info(f"[ALERT] {instrument} | price_change={round(price_change_pips)} | min={min_change}")
+                            if price_change_pips < min_change:
+                                logger.info("Skipping " + instrument + " — price unchanged (" + str(round(price_change_pips)) + ")")
                                 await asyncio.sleep(3)
                                 continue
                             # Send alert
