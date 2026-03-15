@@ -205,6 +205,7 @@ async def fetch_candles(instrument, api_key):
             except Exception as e:
                 logger.error("TwelveData error " + tf_label + ": " + str(e))
                 result[tf_label] = []
+            await asyncio.sleep(8)  # 8s between requests — always executes
     return result
 
 
@@ -705,13 +706,13 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
         score += 1
 
     # 4. Ліквідність знята (sweep) — ціна почала рух
-    sweep_h1 = result.get("sweep_H1", {})
-    sweep_m15 = result.get("sweep_M15", {})
+    sweep_h1 = result.get("sweep_H1") or {}
+    sweep_m15 = result.get("sweep_M15") or {}
     if sweep_h1.get("swept") or sweep_m15.get("swept"):
         score += 1
 
     # 5. Premium/Discount відповідає напрямку
-    zone = result.get("pd_zone_H1", {}).get("zone", "")
+    zone = (result.get("pd_zone_H1") or {}).get("zone", "")
     if (trend == "bullish" and zone == "discount") or (trend == "bearish" and zone == "premium"):
         score += 1
 
@@ -722,11 +723,11 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     boosts = 0
 
     # Буст 1: 5M/15M тригер підтверджує bias
-    trigger = result["trigger_5m"]
-    if trigger.get("confirmed") and trigger.get("direction") == trend:
+    trigger_5m = result.get("trigger_5m") or {}
+    if trigger_5m.get("confirmed") and trigger_5m.get("direction") == trend:
         boosts += 1
         # Додатковий буст якщо BOS+15M (повне підтвердження)
-        if trigger.get("type") == "BOS+15M":
+        if trigger_5m.get("type") == "BOS+15M":
             boosts += 1
 
     # Буст 2: Агресія після sweep (2+ FVG на 5M або wick sweep на H1/H4)
@@ -738,7 +739,7 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
         boosts += 1
 
     # Буст 3: Continuation з корекцією до FVG/IFVG/BPR
-    if struct_confirm.get("scenario") == "continuation" and struct_confirm.get("confidence", 0) >= 4:
+    if (result.get("struct_confirm") or {}).get("scenario") == "continuation" and (result.get("struct_confirm") or {}).get("confidence", 0) >= 4:
         boosts += 1
 
     # Застосовуємо бустери (максимум 5/5)
@@ -848,7 +849,7 @@ def detect_aggressive_reversal(candles_h1, candles_h4, candles_5m, smc_data, dir
         last = candles_h1[-1]
         body_top = max(last["o"], last["c"])
         body_bot = min(last["o"], last["c"])
-        structure = smc_data.get("structure_H1", {})
+        structure = smc_data.get("structure_H1") or {}
         swing_highs = structure.get("swing_highs", [])
         swing_lows = structure.get("swing_lows", [])
 
@@ -873,7 +874,7 @@ def detect_aggressive_reversal(candles_h1, candles_h4, candles_5m, smc_data, dir
         last4 = candles_h4[-1]
         body_top4 = max(last4["o"], last4["c"])
         body_bot4 = min(last4["o"], last4["c"])
-        structure4 = smc_data.get("structure_H4", {})
+        structure4 = smc_data.get("structure_H4") or {}
         highs4 = structure4.get("swing_highs", [])
         lows4 = structure4.get("swing_lows", [])
 
