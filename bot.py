@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 import aiohttp
@@ -23,6 +24,10 @@ INSTRUMENTS = ["EUR_USD", "GBP_USD", "XAU_USD", "BTC_USD"]
 ALERT_USERS = set()
 SENT_ALERTS = {}
 MIN_PRICE_CHANGE_PIPS = 20  # default for forex
+
+# Active signal tracking — {instrument: {entry, sl, tp1, tp2, direction, time, label, notified_entry, notified_tp1}}
+ACTIVE_SIGNALS = {}
+SIGNAL_TTL = 86400  # 24 hours
 
 def min_price_change(instrument):
     """Minimum price change before sending repeat alert."""
@@ -814,6 +819,109 @@ def sl_buffer(instrument):
     return 0.00100
 
 
+def max_sl_distance(instrument):
+    """Maximum allowed SL distance for intraday trading.
+    If SL is further — setup is skipped (bad RR).
+    """
+    if "BTC" in instrument:
+        return 300    # $300
+    if "XAU" in instrument:
+        return 2.0    # $2.00
+    if "GBP" in instrument:
+        return 0.0020  # 20 pips
+    return 0.0015      # 15 pips for EUR and others
+
+
+def find_best_sl(instrument, direction, entry_price, smc_data, buf):
+    """
+    Find the tightest valid SL for intraday trading.
+    Priority:
+    1. Signal swept level (most precise — right behind swept liquidity)
+    2. Nearest swing on M15 within max distance
+    3. Nearest swing on H1 within max distance
+    4. Zone edge within max distance
+    Returns: sl_price or None if no valid SL found within max distance
+    """
+    pv = pip_value(instrument)
+    max_dist = max_sl_distance(instrument)
+    signal = smc_data.get("signal") or {}
+    sig_sl = signal.get("sl_level")
+    sig_dir = signal.get("direction")
+
+    structure_m15 = smc_data.get("structure_M15") or {}
+    structure_h1 = smc_data.get("structure_H1") or {}
+    swing_lows_m15 = structure_m15.get("swing_lows", [])
+    swing_highs_m15 = structure_m15.get("swing_highs", [])
+    swing_lows_h1 = structure_h1.get("swing_lows", [])
+    swing_highs_h1 = structure_h1.get("swing_highs", [])
+
+    candidates = []
+
+    if direction == "buy":
+        # 1. Swept level SL
+        if sig_sl and sig_dir == "buy" and sig_sl < entry_price:
+            dist = entry_price - sig_sl
+            if dist <= max_dist:
+                candidates.append(round(sig_sl - buf, 5))
+
+        # 2. M15 swing lows below entry
+        lows_m15 = sorted(
+            [l["price"] for l in swing_lows_m15 if l["price"] < entry_price],
+            reverse=True  # closest first
+        )
+        for low in lows_m15:
+            dist = entry_price - low
+            if dist <= max_dist:
+                candidates.append(round(low - buf, 5))
+                break
+
+        # 3. H1 swing lows
+        lows_h1 = sorted(
+            [l["price"] for l in swing_lows_h1 if l["price"] < entry_price],
+            reverse=True
+        )
+        for low in lows_h1:
+            dist = entry_price - low
+            if dist <= max_dist:
+                candidates.append(round(low - buf, 5))
+                break
+
+    else:  # sell
+        # 1. Swept level SL
+        if sig_sl and sig_dir == "sell" and sig_sl > entry_price:
+            dist = sig_sl - entry_price
+            if dist <= max_dist:
+                candidates.append(round(sig_sl + buf, 5))
+
+        # 2. M15 swing highs above entry
+        highs_m15 = sorted(
+            [h["price"] for h in swing_highs_m15 if h["price"] > entry_price]
+        )
+        for high in highs_m15:
+            dist = high - entry_price
+            if dist <= max_dist:
+                candidates.append(round(high + buf, 5))
+                break
+
+        # 3. H1 swing highs
+        highs_h1 = sorted(
+            [h["price"] for h in swing_highs_h1 if h["price"] > entry_price]
+        )
+        for high in highs_h1:
+            dist = high - entry_price
+            if dist <= max_dist:
+                candidates.append(round(high + buf, 5))
+                break
+
+    # Return tightest SL (best RR)
+    if candidates:
+        if direction == "buy":
+            return max(candidates)  # highest = closest to entry
+        else:
+            return min(candidates)  # lowest = closest to entry
+    return None
+
+
 
 def min_fvg_size(instrument, tf):
     """Minimum FVG size to be considered valid."""
@@ -1476,19 +1584,15 @@ def calculate_setups(instrument, smc_data):
 
     if buy_zone:
         buy_entry, zone_bottom, zone_top, buy_label, buy_strength = buy_zone
-        # Use signal SL (swept liquidity level) if available — more accurate
-        if sig_sl_level and sig_direction == "buy" and sig_sl_level < buy_entry:
-            buy_sl = round(sig_sl_level - buf, 5)
-        else:
-            lows_below = [l["price"] for l in swing_lows_m15 if l["price"] < buy_entry]
-            if lows_below:
-                buy_sl = round(min(lows_below) - buf, 5)
+        # Use find_best_sl — tightest valid SL within max intraday distance
+        buy_sl = find_best_sl(instrument, "buy", buy_entry, smc_data, buf)
+        if buy_sl is None:
+            # Fallback to zone bottom if no valid SL found
+            fallback_sl = round(zone_bottom - buf, 5)
+            if abs(buy_entry - fallback_sl) <= max_sl_distance(instrument):
+                buy_sl = fallback_sl
             else:
-                lows_h1_below = [l["price"] for l in swing_lows_h1 if l["price"] < buy_entry]
-                if lows_h1_below:
-                    buy_sl = round(min(lows_h1_below) - buf, 5)
-                else:
-                    buy_sl = round(zone_bottom - buf, 5)
+                buy_zone = None  # Skip setup — SL too far
 
     # ── LIQUIDITY TARGETS ──
     # Collect all potential TP targets sorted by distance from entry
@@ -1635,19 +1739,14 @@ def calculate_setups(instrument, smc_data):
 
     if sell_zone:
         sell_entry, zone_bottom, zone_top, sell_label, sell_strength = sell_zone
-        # Use signal SL (swept liquidity level) if available
-        if sig_sl_level and sig_direction == "sell" and sig_sl_level > sell_entry:
-            sell_sl = round(sig_sl_level + buf, 5)
-        else:
-            highs_above = [h["price"] for h in swing_highs_m15 if h["price"] > sell_entry]
-            if highs_above:
-                sell_sl = round(max(highs_above) + buf, 5)
+        # Use find_best_sl — tightest valid SL within max intraday distance
+        sell_sl = find_best_sl(instrument, "sell", sell_entry, smc_data, buf)
+        if sell_sl is None:
+            dist = abs(zone_top - sell_entry)
+            if dist <= max_sl_distance(instrument):
+                sell_sl = round(zone_top + buf, 5)
             else:
-                highs_h1_above = [h["price"] for h in swing_highs_h1 if h["price"] > sell_entry]
-                if highs_h1_above:
-                    sell_sl = round(max(highs_h1_above) + buf, 5)
-                else:
-                    sell_sl = round(zone_top + buf, 5)
+                sell_zone = None  # Skip setup — SL too far
 
     if sell_entry and sell_sl:
         risk = abs(sell_entry - sell_sl)
@@ -1962,6 +2061,64 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
 
 # ── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
 
+
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle free-form messages — chat with the bot about market analysis."""
+    user_msg = update.message.text.strip()
+    chat_id = update.effective_chat.id
+
+    # Build context about active signals
+    signals_context = ""
+    for inst, sig in ACTIVE_SIGNALS.items():
+        if not sig.get("closed"):
+            import time as _t
+            age_h = (_t.time() - sig["time"]) / 3600
+            signals_context += (
+                f"\n{inst}: {sig['direction'].upper()} entry={sig['entry']} "
+                f"sl={sig['sl']} tp1={sig['tp1']} tp2={sig['tp2']} "
+                f"(sent {age_h:.1f}h ago)"
+            )
+
+    if not signals_context:
+        signals_context = "Немає активних сигналів"
+
+    # Build prompt for Claude
+    prompt = f"""Ти SMC торговий асистент. Відповідай коротко і по суті українською мовою.
+
+Активні сигнали:
+{signals_context}
+
+Запитання трейдера: {user_msg}
+
+Якщо питання про ціну чи сигнал — відповідай на основі активних сигналів вище.
+Якщо питання загальне про ринок — відповідай коротко своїми знаннями про SMC.
+Відповідь максимум 3-4 речення. Без зайвих слів."""
+
+    try:
+        thinking_msg = await update.message.reply_text("🤔 Думаю...")
+
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 300,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(ANTHROPIC_API, headers=headers, json=payload) as resp:
+                data = await resp.json()
+                reply = data.get("content", [{}])[0].get("text", "Не вдалось відповісти")
+
+        await thinking_msg.edit_text(reply)
+
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        await update.message.reply_text("Помилка. Спробуй ще раз.")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *SMC Trading Bot*\n\n"
@@ -2088,6 +2245,113 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ALERT LOOP ────────────────────────────────────────────────────────────────
 
+
+def save_active_signal(instrument, setup, direction, price):
+    """Save signal to ACTIVE_SIGNALS for tracking."""
+    import time
+    ACTIVE_SIGNALS[instrument] = {
+        "direction": direction,
+        "entry": setup["entry"],
+        "sl": setup["sl"],
+        "tp1": setup["tp1"],
+        "tp2": setup["tp2"],
+        "tp1_label": setup.get("tp1_label", "TP1"),
+        "tp2_label": setup.get("tp2_label", "TP2"),
+        "zone_label": setup.get("zone_label", ""),
+        "price_at_signal": price,
+        "time": time.time(),
+        "notified_entry": False,  # notified when price near entry
+        "notified_tp1": False,    # notified when TP1 hit
+        "closed": False,
+    }
+
+
+def check_active_signal(instrument, current_price, pv):
+    """
+    Check status of active signal.
+    Returns: {"status": "near_entry"/"tp1_hit"/"sl_hit"/"active"/"expired"/"none", "msg": str}
+    """
+    import time
+    signal = ACTIVE_SIGNALS.get(instrument)
+    if not signal or signal.get("closed"):
+        return {"status": "none"}
+
+    # Check expiry (24 hours)
+    age = time.time() - signal["time"]
+    if age > SIGNAL_TTL:
+        ACTIVE_SIGNALS[instrument]["closed"] = True
+        return {"status": "expired"}
+
+    entry = signal["entry"]
+    sl = signal["sl"]
+    tp1 = signal["tp1"]
+    tp2 = signal["tp2"]
+    direction = signal["direction"]
+
+    # SL hit
+    if direction == "buy" and current_price <= sl:
+        ACTIVE_SIGNALS[instrument]["closed"] = True
+        return {"status": "sl_hit", "level": sl}
+    if direction == "sell" and current_price >= sl:
+        ACTIVE_SIGNALS[instrument]["closed"] = True
+        return {"status": "sl_hit", "level": sl}
+
+    # TP1 hit
+    if not signal["notified_tp1"]:
+        if direction == "buy" and current_price >= tp1:
+            ACTIVE_SIGNALS[instrument]["notified_tp1"] = True
+            return {"status": "tp1_hit", "level": tp1, "label": signal["tp1_label"]}
+        if direction == "sell" and current_price <= tp1:
+            ACTIVE_SIGNALS[instrument]["notified_tp1"] = True
+            return {"status": "tp1_hit", "level": tp1, "label": signal["tp1_label"]}
+
+    # Near entry (within 8 pips for forex, $50 for BTC, $1 for gold)
+    if not signal["notified_entry"]:
+        near_threshold = pv * 8
+        if "BTC" in instrument:
+            near_threshold = 50
+        elif "XAU" in instrument:
+            near_threshold = 1.0
+
+        distance = abs(current_price - entry)
+        if distance <= near_threshold:
+            ACTIVE_SIGNALS[instrument]["notified_entry"] = True
+            return {"status": "near_entry", "entry": entry, "direction": direction}
+
+    return {"status": "active"}
+
+
+def format_signal_update(instrument, status_info, current_price):
+    """Format notification message for signal update."""
+    display = instrument.replace("_", "/")
+    emoji = "📈" if status_info.get("direction") == "buy" else "📉"
+    status = status_info["status"]
+
+    if status == "near_entry":
+        direction_text = "КУПІВЛЯ" if status_info["direction"] == "buy" else "ПРОДАЖ"
+        return (
+            f"⚡ *{display}* — ЦІНА БІЛЯ ТОЧКИ ВХОДУ\n\n"
+            f"{emoji} Напрямок: *{direction_text}*\n"
+            f"🎯 Точка входу: `{status_info['entry']}`\n"
+            f"💰 Поточна ціна: `{current_price}`\n\n"
+            f"👀 Придивляйся за ціною та чекай підтвердження на 5M"
+        )
+    elif status == "tp1_hit":
+        return (
+            f"🎯 *{display}* — TP1 ДОСЯГНУТО!\n\n"
+            f"✅ {status_info['label']}: `{status_info['level']}`\n"
+            f"💰 Поточна ціна: `{current_price}`\n\n"
+            f"💡 Розглянь часткове закриття та перемісти SL в беззбиток"
+        )
+    elif status == "sl_hit":
+        return (
+            f"🛑 *{display}* — СТОП ЛОС АКТИВОВАНО\n\n"
+            f"❌ SL: `{status_info['level']}`\n"
+            f"💰 Поточна ціна: `{current_price}`\n\n"
+            f"📊 Сигнал закрито. Чекаємо наступний сетап"
+        )
+    return ""
+
 async def alert_loop(app):
     await asyncio.sleep(60)
     while True:
@@ -2134,6 +2398,24 @@ async def alert_loop(app):
                         has_real_setup = bool(setups.get("buy") or setups.get("sell"))
                         logger.info(f"[ALERT SCAN] {instrument} | real_setup={has_real_setup} | setups={list(setups.keys())}")
 
+                        # Check active signal status (near entry / TP1 / SL)
+                        pv = pip_value(instrument)
+                        sig_status = check_active_signal(instrument, current_price, pv)
+                        if sig_status["status"] in ("near_entry", "tp1_hit", "sl_hit"):
+                            update_msg = format_signal_update(instrument, sig_status, current_price)
+                            if update_msg:
+                                for chat_id in list(ALERT_USERS):
+                                    try:
+                                        await app.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=update_msg,
+                                            parse_mode=ParseMode.MARKDOWN
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Signal update error: {e}")
+                            await asyncio.sleep(3)
+                            continue
+
                         if score >= 3 and has_real_setup:
                             pv = pip_value(instrument)
                             last_price = SENT_ALERTS.get(instrument, 0)
@@ -2144,6 +2426,13 @@ async def alert_loop(app):
                                 logger.info("Skipping " + instrument + " — price unchanged (" + str(round(price_change_pips)) + ")")
                                 await asyncio.sleep(3)
                                 continue
+                            # Check if there's already an active signal
+                            existing = ACTIVE_SIGNALS.get(instrument, {})
+                            if existing and not existing.get("closed") and (time.time() - existing.get("time", 0)) < SIGNAL_TTL:
+                                logger.info(f"[ALERT] {instrument} — active signal exists, skipping new")
+                                await asyncio.sleep(3)
+                                continue
+
                             # Send alert
                             session_info = get_session_info()
                             analysis = await get_ai_analysis(instrument, smc_data, session_info, alert_mode=True)
@@ -2169,6 +2458,11 @@ async def alert_loop(app):
                                     logger.error("Alert send error: " + str(e))
                             if sent_ok:
                                 SENT_ALERTS[instrument] = current_price
+                                # Save to active signals tracking
+                                direction = "buy" if setups.get("buy") else "sell"
+                                active_setup = setups.get("buy") or setups.get("sell")
+                                if active_setup:
+                                    save_active_signal(instrument, active_setup, direction, current_price)
                                 logger.info("Alert sent for " + instrument + " at " + str(current_price))
                         else:
                             logger.info(f"[ALERT] {instrument} — skipping (score={score}/5, real_setup={has_real_setup})")
@@ -2207,6 +2501,9 @@ def main():
     app.add_handler(CommandHandler("btcusd", cmd_btcusd))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("status", cmd_status))
+    # Chat handler — responds to any non-command message
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_chat))
     logger.info("SMC Trading Bot started!")
     app.run_polling(drop_pending_updates=True)
 
