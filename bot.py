@@ -819,106 +819,79 @@ def sl_buffer(instrument):
     return 0.00100
 
 
-def max_sl_distance(instrument):
-    """Maximum allowed SL distance for intraday trading.
-    If SL is further — setup is skipped (bad RR).
-    """
-    if "BTC" in instrument:
-        return 300    # $300
-    if "XAU" in instrument:
-        return 2.0    # $2.00
-    if "GBP" in instrument:
-        return 0.0020  # 20 pips
-    return 0.0015      # 15 pips for EUR and others
-
-
 def find_best_sl(instrument, direction, entry_price, smc_data, buf):
     """
-    Find the tightest valid SL for intraday trading.
+    SL always behind swept liquidity — trader's rule.
     Priority:
-    1. Signal swept level (most precise — right behind swept liquidity)
-    2. Nearest swing on M15 within max distance
-    3. Nearest swing on H1 within max distance
-    4. Zone edge within max distance
-    Returns: sl_price or None if no valid SL found within max distance
+    1. Swept liquidity level (signal sl_level) — most important
+    2. Nearest swing on M15
+    3. Nearest swing on H1  
+    4. Nearest swing on H4
+    No distance cap — RR filter handles bad setups.
     """
-    pv = pip_value(instrument)
-    max_dist = max_sl_distance(instrument)
     signal = smc_data.get("signal") or {}
     sig_sl = signal.get("sl_level")
     sig_dir = signal.get("direction")
 
     structure_m15 = smc_data.get("structure_M15") or {}
-    structure_h1 = smc_data.get("structure_H1") or {}
-    swing_lows_m15 = structure_m15.get("swing_lows", [])
-    swing_highs_m15 = structure_m15.get("swing_highs", [])
-    swing_lows_h1 = structure_h1.get("swing_lows", [])
-    swing_highs_h1 = structure_h1.get("swing_highs", [])
-
-    candidates = []
+    structure_h1  = smc_data.get("structure_H1") or {}
+    structure_h4  = smc_data.get("structure_H4") or {}
 
     if direction == "buy":
-        # 1. Swept level SL
+        # 1. Swept liquidity — always priority
         if sig_sl and sig_dir == "buy" and sig_sl < entry_price:
-            dist = entry_price - sig_sl
-            if dist <= max_dist:
-                candidates.append(round(sig_sl - buf, 5))
+            return round(sig_sl - buf, 5)
 
-        # 2. M15 swing lows below entry
+        # 2. Nearest M15 swing low
         lows_m15 = sorted(
-            [l["price"] for l in swing_lows_m15 if l["price"] < entry_price],
-            reverse=True  # closest first
-        )
-        for low in lows_m15:
-            dist = entry_price - low
-            if dist <= max_dist:
-                candidates.append(round(low - buf, 5))
-                break
-
-        # 3. H1 swing lows
-        lows_h1 = sorted(
-            [l["price"] for l in swing_lows_h1 if l["price"] < entry_price],
+            [l["price"] for l in structure_m15.get("swing_lows", []) if l["price"] < entry_price],
             reverse=True
         )
-        for low in lows_h1:
-            dist = entry_price - low
-            if dist <= max_dist:
-                candidates.append(round(low - buf, 5))
-                break
+        if lows_m15:
+            return round(lows_m15[0] - buf, 5)
+
+        # 3. Nearest H1 swing low
+        lows_h1 = sorted(
+            [l["price"] for l in structure_h1.get("swing_lows", []) if l["price"] < entry_price],
+            reverse=True
+        )
+        if lows_h1:
+            return round(lows_h1[0] - buf, 5)
+
+        # 4. Nearest H4 swing low
+        lows_h4 = sorted(
+            [l["price"] for l in structure_h4.get("swing_lows", []) if l["price"] < entry_price],
+            reverse=True
+        )
+        if lows_h4:
+            return round(lows_h4[0] - buf, 5)
 
     else:  # sell
-        # 1. Swept level SL
+        # 1. Swept liquidity — always priority
         if sig_sl and sig_dir == "sell" and sig_sl > entry_price:
-            dist = sig_sl - entry_price
-            if dist <= max_dist:
-                candidates.append(round(sig_sl + buf, 5))
+            return round(sig_sl + buf, 5)
 
-        # 2. M15 swing highs above entry
+        # 2. Nearest M15 swing high
         highs_m15 = sorted(
-            [h["price"] for h in swing_highs_m15 if h["price"] > entry_price]
+            [h["price"] for h in structure_m15.get("swing_highs", []) if h["price"] > entry_price]
         )
-        for high in highs_m15:
-            dist = high - entry_price
-            if dist <= max_dist:
-                candidates.append(round(high + buf, 5))
-                break
+        if highs_m15:
+            return round(highs_m15[0] + buf, 5)
 
-        # 3. H1 swing highs
+        # 3. Nearest H1 swing high
         highs_h1 = sorted(
-            [h["price"] for h in swing_highs_h1 if h["price"] > entry_price]
+            [h["price"] for h in structure_h1.get("swing_highs", []) if h["price"] > entry_price]
         )
-        for high in highs_h1:
-            dist = high - entry_price
-            if dist <= max_dist:
-                candidates.append(round(high + buf, 5))
-                break
+        if highs_h1:
+            return round(highs_h1[0] + buf, 5)
 
-    # Return tightest SL (best RR)
-    if candidates:
-        if direction == "buy":
-            return max(candidates)  # highest = closest to entry
-        else:
-            return min(candidates)  # lowest = closest to entry
+        # 4. Nearest H4 swing high
+        highs_h4 = sorted(
+            [h["price"] for h in structure_h4.get("swing_highs", []) if h["price"] > entry_price]
+        )
+        if highs_h4:
+            return round(highs_h4[0] + buf, 5)
+
     return None
 
 
@@ -1587,12 +1560,7 @@ def calculate_setups(instrument, smc_data):
         # Use find_best_sl — tightest valid SL within max intraday distance
         buy_sl = find_best_sl(instrument, "buy", buy_entry, smc_data, buf)
         if buy_sl is None:
-            # Fallback to zone bottom if no valid SL found
-            fallback_sl = round(zone_bottom - buf, 5)
-            if abs(buy_entry - fallback_sl) <= max_sl_distance(instrument):
-                buy_sl = fallback_sl
-            else:
-                buy_zone = None  # Skip setup — SL too far
+            buy_sl = round(zone_bottom - buf, 5)
 
     # ── LIQUIDITY TARGETS ──
     # Collect all potential TP targets sorted by distance from entry
@@ -1742,11 +1710,7 @@ def calculate_setups(instrument, smc_data):
         # Use find_best_sl — tightest valid SL within max intraday distance
         sell_sl = find_best_sl(instrument, "sell", sell_entry, smc_data, buf)
         if sell_sl is None:
-            dist = abs(zone_top - sell_entry)
-            if dist <= max_sl_distance(instrument):
-                sell_sl = round(zone_top + buf, 5)
-            else:
-                sell_zone = None  # Skip setup — SL too far
+            sell_sl = round(zone_top + buf, 5)
 
     if sell_entry and sell_sl:
         risk = abs(sell_entry - sell_sl)
