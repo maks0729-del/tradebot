@@ -1557,8 +1557,14 @@ def calculate_setups(instrument, smc_data):
 
     if buy_zone:
         buy_entry, zone_bottom, zone_top, buy_label, buy_strength = buy_zone
-        # Use find_best_sl — tightest valid SL within max intraday distance
-        buy_sl = find_best_sl(instrument, "buy", buy_entry, smc_data, buf)
+        # Skip if entry already passed — price already above entry zone
+        if buy_entry >= price * 0.9999:
+            buy_zone = None
+        if not buy_zone:
+            buy_entry = None
+        if buy_entry:
+            # Use find_best_sl — tightest valid SL within max intraday distance
+            buy_sl = find_best_sl(instrument, "buy", buy_entry, smc_data, buf)
         if buy_sl is None:
             buy_sl = round(zone_bottom - buf, 5)
 
@@ -1707,8 +1713,14 @@ def calculate_setups(instrument, smc_data):
 
     if sell_zone:
         sell_entry, zone_bottom, zone_top, sell_label, sell_strength = sell_zone
-        # Use find_best_sl — tightest valid SL within max intraday distance
-        sell_sl = find_best_sl(instrument, "sell", sell_entry, smc_data, buf)
+        # Skip if entry already passed — price already below entry zone
+        if sell_entry <= price * 1.0001:
+            sell_zone = None
+        if not sell_zone:
+            sell_entry = None
+        if sell_entry:
+            # Use find_best_sl — tightest valid SL within max intraday distance
+            sell_sl = find_best_sl(instrument, "sell", sell_entry, smc_data, buf)
         if sell_sl is None:
             sell_sl = round(zone_top + buf, 5)
 
