@@ -403,6 +403,8 @@ def find_order_blocks(candles, structure):
 
             if sweep_happened and bos_confirmed and strong_impulse and fvg_formed:
                 strength = min(impulse_size / body_size / 2, 3.0)
+                # Check if HH confirmed by BODY (not just wick)
+                body_confirmed_hh = next1["c"] > max(c["h"], prev["h"])
                 obs.append({
                     "type": "bullish_ob",
                     "top": c["o"],
@@ -411,6 +413,7 @@ def find_order_blocks(candles, structure):
                     "strength": round(strength, 2),
                     "has_fvg": True,
                     "swept_liquidity": True,
+                    "body_confirmed": body_confirmed_hh,
                 })
 
         # ── BEARISH OB ──
@@ -432,6 +435,8 @@ def find_order_blocks(candles, structure):
 
             if sweep_happened and bos_confirmed and strong_impulse and fvg_formed:
                 strength = min(impulse_size / body_size / 2, 3.0)
+                # Check if LL confirmed by BODY (not just wick)
+                body_confirmed_ll = next1["c"] < min(c["l"], prev["l"])
                 obs.append({
                     "type": "bearish_ob",
                     "top": c["h"],
@@ -440,6 +445,7 @@ def find_order_blocks(candles, structure):
                     "strength": round(strength, 2),
                     "has_fvg": True,
                     "swept_liquidity": True,
+                    "body_confirmed": body_confirmed_ll,
                 })
 
     bullish_obs = [o for o in obs if o["type"] == "bullish_ob"][-2:]
@@ -702,7 +708,13 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     h4_candles = candles_by_tf.get("H4", [])
     result["eqh_eql_H1"] = find_eqh_eql(h1_candles, instrument)
     result["eqh_eql_H4"] = find_eqh_eql(h4_candles, instrument)
-    result["fibonacci"] = calculate_fibonacci(h1_candles)
+    # Fibonacci — H1 for forex/XAU, H4 for BTC
+    if "BTC" in instrument:
+        result["fibonacci"] = calculate_fibonacci(candles_by_tf.get("H4", []))
+        result["fibonacci_h1"] = calculate_fibonacci(h1_candles)
+    else:
+        result["fibonacci"] = calculate_fibonacci(h1_candles)
+        result["fibonacci_h1"] = result["fibonacci"]
 
     # ── 5M/15M TRIGGER ──
     bias_1h = result.get("structure_H1", {}).get("trend", "unknown")
@@ -784,6 +796,22 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     signal = result.get("signal") or {}
     if signal.get("type") == "reversal" and signal.get("confidence", 0) >= 3:
         boosts += 1
+
+    # Буст 6: OTE зона (FVG або BPR в золотій Fibo зоні)
+    fib_data = result.get("fibonacci") or {}
+    price_now = result.get("current_price", 0)
+    if fib_data and price_now:
+        f705 = fib_data.get("fib_0_705", 0)
+        f79  = fib_data.get("fib_0_79", 0)
+        f618 = fib_data.get("fib_0_618", 0)
+        f50  = fib_data.get("fib_0_5", 0)
+        trend = (result.get("structure_H1") or {}).get("trend", "")
+        if trend == "bullish" and f79 and f50:
+            if f79 <= price_now <= f50:
+                boosts += 1  # Price in OTE buy zone
+        elif trend == "bearish" and f50 and f79:
+            if f50 <= price_now <= f79:
+                boosts += 1  # Price in OTE sell zone
 
     # Буст 5: Reversal на старшому TF (H4 або D) — сильніший сигнал
     if signal.get("type") == "reversal" and signal.get("sl_tf") in ("H4", "D"):
@@ -1117,78 +1145,132 @@ def analyze_structure_confirmation(candles_h1, candles_m15, candles_h4, smc_data
     return result
 
 
-def find_entry_zone(ob_list, fvg_list, bpr_list, price, direction):
+def is_in_ote(price_level, fib, direction):
+    """Check if price level is in OTE zone (0.5 - 0.786 Fibonacci)."""
+    if not fib:
+        return False, 0
+    f50  = fib.get("fib_0_5")
+    f618 = fib.get("fib_0_618")
+    f705 = fib.get("fib_0_705")
+    f79  = fib.get("fib_0_79")
+    if not all([f50, f618, f705, f79]):
+        return False, 0
+
+    if direction == "buy":
+        # For buy: OTE is between swing_low corrected to 0.5-0.786
+        ote_high = f50
+        ote_low  = f79
+        in_ote = ote_low <= price_level <= ote_high
+        # Score bonus based on zone quality
+        if f705 <= price_level <= f79:
+            return in_ote, 2   # Golden OTE zone
+        elif f618 <= price_level <= f705:
+            return in_ote, 1   # Good OTE zone
+        elif f50 <= price_level <= f618:
+            return in_ote, 0   # Basic 0.5 zone
+    else:
+        # For sell: OTE is between swing_high corrected to 0.5-0.786
+        ote_low  = f50
+        ote_high = f79
+        in_ote = ote_low <= price_level <= ote_high
+        if f705 <= price_level <= f79:
+            return in_ote, 2
+        elif f618 <= price_level <= f705:
+            return in_ote, 1
+        elif f50 <= price_level <= f618:
+            return in_ote, 0
+    return False, 0
+
+
+def find_entry_zone(ob_list, fvg_list, bpr_list, price, direction, fib=None):
     """
-    Confluence-based entry zone hierarchy:
-    1. OB + FVG confluence ★★★★★
-    2. OB + IFVG confluence ★★★★☆
-    3. BPR ★★★★☆
-    4. OB alone ★★★☆☆
-    5. FVG alone ★★☆☆☆
-    6. IFVG alone ★★☆☆☆
+    OTE-aware entry zone hierarchy:
+
+    ★★★★★  FVG в Golden OTE (0.705-0.786)
+    ★★★★★  BPR в OTE зоні
+    ★★★★☆  FVG в OTE (0.618-0.705)
+    ★★★★☆  Валідний OB (body_confirmed) в OTE
+    ★★★★☆  FVG в 0.5 зоні
+    ★★★☆☆  BPR поза OTE
+    ★★★☆☆  Валідний OB в OTE (без body confirm)
+    ★★★☆☆  OB + FVG confluence
+    ★★☆☆☆  FVG поза Fibo
+    ★★☆☆☆  Слабкий OB
     """
     if direction == "buy":
-        obs = [o for o in ob_list if o["type"] == "bullish_ob" and o["bottom"] < price]
-        fvgs = [f for f in fvg_list if f["type"] == "bullish_fvg" and f["bottom"] < price]
+        obs   = [o for o in ob_list if o["type"] == "bullish_ob"  and o["bottom"] < price]
+        fvgs  = [f for f in fvg_list if f["type"] == "bullish_fvg" and f["bottom"] < price]
         ifvgs = [f for f in fvg_list if f["type"] == "bullish_ifvg" and f["bottom"] < price]
-        bprs = [b for b in bpr_list if b["mid"] < price]
+        bprs  = [b for b in bpr_list if b["mid"] < price]
     else:
-        obs = [o for o in ob_list if o["type"] == "bearish_ob" and o["top"] > price]
-        fvgs = [f for f in fvg_list if f["type"] == "bearish_fvg" and f["top"] > price]
+        obs   = [o for o in ob_list if o["type"] == "bearish_ob"  and o["top"] > price]
+        fvgs  = [f for f in fvg_list if f["type"] == "bearish_fvg" and f["top"] > price]
         ifvgs = [f for f in fvg_list if f["type"] == "bearish_ifvg" and f["top"] > price]
-        bprs = [b for b in bpr_list if b["mid"] > price]
+        bprs  = [b for b in bpr_list if b["mid"] > price]
 
-    best = None
+    scored = []  # list of (score, entry, bottom, top, label)
 
-    # 1. OB + FVG confluence
+    # ── Score FVGs ──
+    for fvg in fvgs + ifvgs:
+        mid = fvg.get("mid", (fvg["top"] + fvg["bottom"]) / 2)
+        in_ote, ote_bonus = is_in_ote(mid, fib, direction)
+        is_ifvg = "ifvg" in fvg["type"]
+        base = 3 if not is_ifvg else 2
+        score = base + ote_bonus + (1 if in_ote else 0)
+        if direction == "buy":
+            entry = round(fvg["top"], 5)
+        else:
+            entry = round(fvg["bottom"], 5)
+        label = ("FVG" if not is_ifvg else "IFVG")
+        if in_ote:
+            label += f" OTE({0.705 if ote_bonus==2 else 0.618 if ote_bonus==1 else 0.5})"
+        scored.append((score, entry, round(fvg["bottom"],5), round(fvg["top"],5), label))
+
+    # ── Score BPRs ──
+    for bpr in bprs:
+        mid = bpr["mid"]
+        in_ote, ote_bonus = is_in_ote(mid, fib, direction)
+        score = 4 + ote_bonus + (1 if in_ote else 0)
+        label = "BPR" + (" OTE" if in_ote else "")
+        scored.append((score, round(mid,5), round(bpr["bottom"],5), round(bpr["top"],5), label))
+
+    # ── Score OBs ──
     for ob in obs:
-        for fvg in fvgs:
-            ot = min(ob["top"], fvg["top"])
-            ob_ = max(ob["bottom"], fvg["bottom"])
-            if ot > ob_:
-                mid = (ot + ob_) / 2
-                best = (round(mid, 5), round(ob_, 5), round(ot, 5), "OB+FVG confluence", 5)
-                break
-        if best:
-            break
+        mid = (ob["top"] + ob["bottom"]) / 2
+        in_ote, ote_bonus = is_in_ote(mid, fib, direction)
+        body_ok = ob.get("body_confirmed", False)
+        swept   = ob.get("swept_liquidity", False)
+        has_fvg = ob.get("has_fvg", False)
 
-    # 2. OB + IFVG confluence
-    if not best:
-        for ob in obs:
-            for ifvg in ifvgs:
-                ot = min(ob["top"], ifvg["top"])
-                ob_ = max(ob["bottom"], ifvg["bottom"])
-                if ot > ob_:
-                    mid = (ot + ob_) / 2
-                    best = (round(mid, 5), round(ob_, 5), round(ot, 5), "OB+IFVG confluence", 4)
-                    break
-            if best:
-                break
+        # Base score
+        if swept and has_fvg and body_ok:
+            base = 4   # fully valid OB
+        elif swept and has_fvg:
+            base = 3   # valid OB (wick confirmed)
+        elif swept:
+            base = 2   # partial
+        else:
+            base = 1   # weak
 
-    # 3. BPR
-    if not best and bprs:
-        b = bprs[-1] if direction == "buy" else bprs[0]
-        best = (round(b["mid"], 5), round(b["bottom"], 5), round(b["top"], 5), "BPR", 4)
+        score = base + ote_bonus + (1 if in_ote else 0)
+        if direction == "buy":
+            entry = round(ob["bottom"], 5)  # enter at bottom of OB
+        else:
+            entry = round(ob["top"], 5)     # enter at top of OB
+        label = "OB"
+        if body_ok and swept:
+            label = "OB★"
+        if in_ote:
+            label += " OTE"
+        scored.append((score, entry, round(ob["bottom"],5), round(ob["top"],5), label))
 
-    # 4. OB alone
-    if not best and obs:
-        ob = obs[-1] if direction == "buy" else obs[0]
-        entry = round(ob["top"], 5) if direction == "buy" else round(ob["bottom"], 5)
-        best = (entry, round(ob["bottom"], 5), round(ob["top"], 5), "Order Block", 3)
+    if not scored:
+        return None
 
-    # 5. FVG alone
-    if not best and fvgs:
-        fvg = fvgs[-1] if direction == "buy" else fvgs[0]
-        entry = round(fvg["top"], 5) if direction == "buy" else round(fvg["bottom"], 5)
-        best = (entry, round(fvg["bottom"], 5), round(fvg["top"], 5), "FVG", 2)
-
-    # 6. IFVG alone
-    if not best and ifvgs:
-        ifvg = ifvgs[-1] if direction == "buy" else ifvgs[0]
-        entry = round(ifvg["top"], 5) if direction == "buy" else round(ifvg["bottom"], 5)
-        best = (entry, round(ifvg["bottom"], 5), round(ifvg["top"], 5), "IFVG", 2)
-
-    return best
+    # Return highest scored zone
+    scored.sort(key=lambda x: x[0], reverse=True)
+    score, entry, bottom, top, label = scored[0]
+    return (entry, bottom, top, label, min(score, 5))
 
 
 
@@ -1540,7 +1622,8 @@ def calculate_setups(instrument, smc_data):
     sig_sl_tf = signal.get("sl_tf")
 
     # ── BUY SETUP ──
-    buy_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "buy")
+    fib = smc_data.get("fibonacci") or {}
+    buy_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "buy", fib)
 
     # Continuation BUY — override with correction zone below price
     if sc_scenario == "continuation" and sc_direction == "buy":
@@ -1692,7 +1775,7 @@ def calculate_setups(instrument, smc_data):
         }
 
     # ── SELL SETUP ──
-    sell_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "sell")
+    sell_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "sell", fib)
 
     # Override: if continuation SELL — enter from correction zone above price
     if sc_scenario == "continuation" and sc_direction == "sell":
