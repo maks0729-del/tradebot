@@ -2323,6 +2323,83 @@ def save_active_signal(instrument, setup, direction, price):
     }
 
 
+
+def detect_trigger_confirmation(candles_5m, candles_15m, direction):
+    """
+    Detect BOS with body close + at least 1 FVG formed.
+    For active signal — confirms entry timing.
+    
+    BUY trigger:  body close ABOVE swing high + FVG formed upward
+    SELL trigger: body close BELOW swing low  + FVG formed downward
+    
+    Returns: {"confirmed": bool, "type": "5M"/"5M+15M", "fvg_count": int}
+    """
+    result = {"confirmed": False, "type": None, "fvg_count": 0}
+
+    if not candles_5m or len(candles_5m) < 5:
+        return result
+
+    recent_5m = candles_5m[-10:]
+    last = recent_5m[-1]
+    prev = recent_5m[-2]
+
+    # Find recent swing high/low on 5M
+    highs = [c["h"] for c in recent_5m[:-1]]
+    lows  = [c["l"] for c in recent_5m[:-1]]
+    if not highs or not lows:
+        return result
+
+    prev_high = max(highs[-5:]) if len(highs) >= 5 else max(highs)
+    prev_low  = min(lows[-5:])  if len(lows)  >= 5 else min(lows)
+
+    # Check BOS with BODY (not just wick)
+    body_top = max(last["o"], last["c"])
+    body_bot = min(last["o"], last["c"])
+
+    bos_confirmed = False
+    if direction == "buy" and body_top > prev_high:
+        bos_confirmed = True
+    elif direction == "sell" and body_bot < prev_low:
+        bos_confirmed = True
+
+    if not bos_confirmed:
+        return result
+
+    # Count FVGs formed in last 3 candles (strength proof)
+    fvg_count = 0
+    check_candles = recent_5m[-4:]
+    for i in range(1, len(check_candles) - 1):
+        p = check_candles[i - 1]
+        n = check_candles[i + 1]
+        if direction == "buy" and n["l"] > p["h"]:
+            fvg_count += 1
+        elif direction == "sell" and n["h"] < p["l"]:
+            fvg_count += 1
+
+    if fvg_count < 1:
+        return result  # Need at least 1 FVG
+
+    result["confirmed"] = True
+    result["fvg_count"] = fvg_count
+    result["type"] = "5M"
+
+    # Check 15M confirmation — body close in same direction
+    if candles_15m and len(candles_15m) >= 3:
+        last_15 = candles_15m[-1]
+        prev_15 = candles_15m[-2]
+        body_top_15 = max(last_15["o"], last_15["c"])
+        body_bot_15 = min(last_15["o"], last_15["c"])
+        highs_15 = [c["h"] for c in candles_15m[-5:-1]]
+        lows_15  = [c["l"] for c in candles_15m[-5:-1]]
+
+        if highs_15 and lows_15:
+            if direction == "buy" and body_top_15 > max(highs_15):
+                result["type"] = "5M+15M"
+            elif direction == "sell" and body_bot_15 < min(lows_15):
+                result["type"] = "5M+15M"
+
+    return result
+
 def check_active_signal(instrument, current_price, pv):
     """
     Check status of active signal.
@@ -2371,6 +2448,20 @@ def check_active_signal(instrument, current_price, pv):
             ACTIVE_SIGNALS[instrument]["entry_reached"] = True
             entry_reached = True
 
+    # Trigger check — BOS+FVG on 5M even before entry reached
+    if not entry_reached and not signal.get("notified_trigger"):
+        # We need candles to check trigger — passed via smc_data in alert loop
+        trigger = signal.get("last_trigger_check") or {}
+        if trigger.get("confirmed"):
+            ACTIVE_SIGNALS[instrument]["notified_trigger"] = True
+            return {
+                "status": "trigger_confirmed",
+                "direction": direction,
+                "entry": entry,
+                "type": trigger.get("type", "5M"),
+                "fvg_count": trigger.get("fvg_count", 1),
+            }
+
     if not entry_reached:
         return {"status": "active"}
 
@@ -2399,6 +2490,20 @@ def format_signal_update(instrument, status_info, current_price):
     display = instrument.replace("_", "/")
     emoji = "📈" if status_info.get("direction") == "buy" else "📉"
     status = status_info["status"]
+
+    if status == "trigger_confirmed":
+        direction_text = "КУПІВЛЯ" if status_info.get("direction") == "buy" else "ПРОДАЖ"
+        sig_type = status_info.get("type", "5M")
+        fvg_count = status_info.get("fvg_count", 1)
+        confirm_emoji = "🔥" if sig_type == "5M+15M" else "⚡"
+        return (
+            f"{confirm_emoji} *{display}* — ТРИГЕР ПІДТВЕРДЖЕНО!\n\n"
+            f"{emoji} Напрямок: *{direction_text}*\n"
+            f"🎯 Точка входу: `{status_info['entry']}`\n"
+            f"📊 Підтвердження: *{sig_type}* (злам тілом + {fvg_count} FVG)\n"
+            f"💰 Поточна ціна: `{current_price}`\n\n"
+            f"{'✅ Повне підтвердження 5M+15M — сильний сигнал!' if sig_type == '5M+15M' else '⚠️ Підтвердження тільки 5M — чекай 15M для впевненості'}"
+        )
 
     if status == "near_entry":
         direction_text = "КУПІВЛЯ" if status_info["direction"] == "buy" else "ПРОДАЖ"
@@ -2471,8 +2576,19 @@ async def alert_loop(app):
                         has_real_setup = bool(setups.get("buy") or setups.get("sell"))
                         logger.info(f"[ALERT SCAN] {instrument} | real_setup={has_real_setup} | setups={list(setups.keys())}")
 
-                        # Check active signal status (near entry / TP1 / SL)
+                        # Check active signal status (near entry / TP1 / SL / trigger)
                         pv = pip_value(instrument)
+                        # Update trigger check in active signal before checking status
+                        if ACTIVE_SIGNALS.get(instrument) and not ACTIVE_SIGNALS[instrument].get("closed"):
+                            sig = ACTIVE_SIGNALS[instrument]
+                            if not sig.get("notified_trigger"):
+                                candles_5m_data = candles.get("M5", [])
+                                candles_15m_data = candles.get("M15", [])
+                                trig = detect_trigger_confirmation(
+                                    candles_5m_data, candles_15m_data,
+                                    sig.get("direction", "buy")
+                                )
+                                ACTIVE_SIGNALS[instrument]["last_trigger_check"] = trig
                         sig_status = check_active_signal(instrument, current_price, pv)
                         if sig_status["status"] in ("near_entry", "tp1_hit", "sl_hit"):
                             update_msg = format_signal_update(instrument, sig_status, current_price)
