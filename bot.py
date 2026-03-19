@@ -821,76 +821,78 @@ def sl_buffer(instrument):
 
 def find_best_sl(instrument, direction, entry_price, smc_data, buf):
     """
-    SL always behind swept liquidity — trader's rule.
+    SL always behind swept liquidity level.
     Priority:
-    1. Swept liquidity level (signal sl_level) — most important
-    2. Nearest swing on M15
-    3. Nearest swing on H1  
-    4. Nearest swing on H4
-    No distance cap — RR filter handles bad setups.
+    1. Swept liquidity level from sweep_H1 / sweep_H4 / sweep_M15
+    2. Liquidity pool (BSL/SSL) from liquidity_H1 / H4 / M15
+    3. Nearest swing from structure (last resort)
     """
-    signal = smc_data.get("signal") or {}
-    sig_sl = signal.get("sl_level")
-    sig_dir = signal.get("direction")
+    # ── 1. Swept liquidity levels (most important) ──
+    swept_candidates = []
+    for tf in ["H1", "H4", "M15"]:
+        sweep = smc_data.get("sweep_" + tf) or {}
+        if not sweep or not sweep.get("type"):
+            continue
+        swept_level = sweep.get("level", 0)
+        if not swept_level:
+            continue
+        # For buy: swept level should be below entry (swept BSL = support)
+        if direction == "buy" and swept_level < entry_price:
+            swept_candidates.append(round(swept_level - buf, 5))
+        # For sell: swept level should be above entry (swept SSL = resistance)
+        elif direction == "sell" and swept_level > entry_price:
+            swept_candidates.append(round(swept_level + buf, 5))
 
+    if swept_candidates:
+        # Return closest to entry (best RR)
+        if direction == "buy":
+            return max(swept_candidates)   # highest = closest to entry
+        else:
+            return min(swept_candidates)   # lowest = closest to entry
+
+    # ── 2. Liquidity pools between entry and current price ──
+    liq_candidates = []
+    for tf in ["M15", "H1", "H4"]:
+        liq = smc_data.get("liquidity_" + tf) or {}
+        if direction == "buy":
+            for lvl in liq.get("buy_side", []):
+                p = lvl["price"]
+                if p < entry_price:
+                    liq_candidates.append(round(p - buf, 5))
+        else:
+            for lvl in liq.get("sell_side", []):
+                p = lvl["price"]
+                if p > entry_price:
+                    liq_candidates.append(round(p + buf, 5))
+
+    if liq_candidates:
+        if direction == "buy":
+            return max(liq_candidates)
+        else:
+            return min(liq_candidates)
+
+    # ── 3. Nearest swing (last resort) ──
     structure_m15 = smc_data.get("structure_M15") or {}
     structure_h1  = smc_data.get("structure_H1") or {}
     structure_h4  = smc_data.get("structure_H4") or {}
 
     if direction == "buy":
-        # 1. Swept liquidity — always priority
-        if sig_sl and sig_dir == "buy" and sig_sl < entry_price:
-            return round(sig_sl - buf, 5)
+        for struct in [structure_m15, structure_h1, structure_h4]:
+            lows = sorted(
+                [l["price"] for l in struct.get("swing_lows", []) if l["price"] < entry_price],
+                reverse=True
+            )
+            if lows:
+                return round(lows[0] - buf, 5)
+    else:
+        for struct in [structure_m15, structure_h1, structure_h4]:
+            highs = sorted(
+                [h["price"] for h in struct.get("swing_highs", []) if h["price"] > entry_price]
+            )
+            if highs:
+                return round(highs[0] + buf, 5)
 
-        # 2. Nearest M15 swing low
-        lows_m15 = sorted(
-            [l["price"] for l in structure_m15.get("swing_lows", []) if l["price"] < entry_price],
-            reverse=True
-        )
-        if lows_m15:
-            return round(lows_m15[0] - buf, 5)
-
-        # 3. Nearest H1 swing low
-        lows_h1 = sorted(
-            [l["price"] for l in structure_h1.get("swing_lows", []) if l["price"] < entry_price],
-            reverse=True
-        )
-        if lows_h1:
-            return round(lows_h1[0] - buf, 5)
-
-        # 4. Nearest H4 swing low
-        lows_h4 = sorted(
-            [l["price"] for l in structure_h4.get("swing_lows", []) if l["price"] < entry_price],
-            reverse=True
-        )
-        if lows_h4:
-            return round(lows_h4[0] - buf, 5)
-
-    else:  # sell
-        # 1. Swept liquidity — always priority
-        if sig_sl and sig_dir == "sell" and sig_sl > entry_price:
-            return round(sig_sl + buf, 5)
-
-        # 2. Nearest M15 swing high
-        highs_m15 = sorted(
-            [h["price"] for h in structure_m15.get("swing_highs", []) if h["price"] > entry_price]
-        )
-        if highs_m15:
-            return round(highs_m15[0] + buf, 5)
-
-        # 3. Nearest H1 swing high
-        highs_h1 = sorted(
-            [h["price"] for h in structure_h1.get("swing_highs", []) if h["price"] > entry_price]
-        )
-        if highs_h1:
-            return round(highs_h1[0] + buf, 5)
-
-        # 4. Nearest H4 swing high
-        highs_h4 = sorted(
-            [h["price"] for h in structure_h4.get("swing_highs", []) if h["price"] > entry_price]
-        )
-        if highs_h4:
-            return round(highs_h4[0] + buf, 5)
+    return None
 
     return None
 
@@ -1557,14 +1559,8 @@ def calculate_setups(instrument, smc_data):
 
     if buy_zone:
         buy_entry, zone_bottom, zone_top, buy_label, buy_strength = buy_zone
-        # Skip if entry already passed — price already above entry zone
-        if buy_entry >= price * 0.9999:
-            buy_zone = None
-        if not buy_zone:
-            buy_entry = None
-        if buy_entry:
-            # Use find_best_sl — tightest valid SL within max intraday distance
-            buy_sl = find_best_sl(instrument, "buy", buy_entry, smc_data, buf)
+        # Use find_best_sl — tightest valid SL within max intraday distance
+        buy_sl = find_best_sl(instrument, "buy", buy_entry, smc_data, buf)
         if buy_sl is None:
             buy_sl = round(zone_bottom - buf, 5)
 
@@ -1713,14 +1709,8 @@ def calculate_setups(instrument, smc_data):
 
     if sell_zone:
         sell_entry, zone_bottom, zone_top, sell_label, sell_strength = sell_zone
-        # Skip if entry already passed — price already below entry zone
-        if sell_entry <= price * 1.0001:
-            sell_zone = None
-        if not sell_zone:
-            sell_entry = None
-        if sell_entry:
-            # Use find_best_sl — tightest valid SL within max intraday distance
-            sell_sl = find_best_sl(instrument, "sell", sell_entry, smc_data, buf)
+        # Use find_best_sl — tightest valid SL within max intraday distance
+        sell_sl = find_best_sl(instrument, "sell", sell_entry, smc_data, buf)
         if sell_sl is None:
             sell_sl = round(zone_top + buf, 5)
 
@@ -2225,9 +2215,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def save_active_signal(instrument, setup, direction, price):
     """Save signal to ACTIVE_SIGNALS for tracking."""
     import time
+    entry = setup["entry"]
+    # Check if price already at/past entry zone at signal time
+    if direction == "buy":
+        entry_reached = price <= entry * 1.0005  # price at or below entry
+    else:
+        entry_reached = price >= entry * 0.9995  # price at or above entry
+
     ACTIVE_SIGNALS[instrument] = {
         "direction": direction,
-        "entry": setup["entry"],
+        "entry": entry,
         "sl": setup["sl"],
         "tp1": setup["tp1"],
         "tp2": setup["tp2"],
@@ -2236,8 +2233,9 @@ def save_active_signal(instrument, setup, direction, price):
         "zone_label": setup.get("zone_label", ""),
         "price_at_signal": price,
         "time": time.time(),
-        "notified_entry": False,  # notified when price near entry
-        "notified_tp1": False,    # notified when TP1 hit
+        "entry_reached": entry_reached,  # True if price already at entry
+        "notified_entry": entry_reached, # skip near_entry if already there
+        "notified_tp1": False,
         "closed": False,
     }
 
@@ -2264,7 +2262,36 @@ def check_active_signal(instrument, current_price, pv):
     tp2 = signal["tp2"]
     direction = signal["direction"]
 
-    # SL hit
+    # Near entry check — notify when price approaches entry zone
+    if not signal["notified_entry"]:
+        near_threshold = pv * 10
+        if "BTC" in instrument:
+            near_threshold = 100
+        elif "XAU" in instrument:
+            near_threshold = 1.5
+
+        distance = abs(current_price - entry)
+        if distance <= near_threshold:
+            ACTIVE_SIGNALS[instrument]["notified_entry"] = True
+            ACTIVE_SIGNALS[instrument]["entry_reached"] = True
+            return {"status": "near_entry", "entry": entry, "direction": direction}
+
+    # Only check SL/TP after entry was reached
+    entry_reached = signal.get("entry_reached", False)
+
+    # Mark entry as reached if price crossed entry level
+    if not entry_reached:
+        if direction == "buy" and current_price <= entry:
+            ACTIVE_SIGNALS[instrument]["entry_reached"] = True
+            entry_reached = True
+        elif direction == "sell" and current_price >= entry:
+            ACTIVE_SIGNALS[instrument]["entry_reached"] = True
+            entry_reached = True
+
+    if not entry_reached:
+        return {"status": "active"}
+
+    # SL hit — only after entry reached
     if direction == "buy" and current_price <= sl:
         ACTIVE_SIGNALS[instrument]["closed"] = True
         return {"status": "sl_hit", "level": sl}
@@ -2272,7 +2299,7 @@ def check_active_signal(instrument, current_price, pv):
         ACTIVE_SIGNALS[instrument]["closed"] = True
         return {"status": "sl_hit", "level": sl}
 
-    # TP1 hit
+    # TP1 hit — only after entry reached
     if not signal["notified_tp1"]:
         if direction == "buy" and current_price >= tp1:
             ACTIVE_SIGNALS[instrument]["notified_tp1"] = True
@@ -2280,19 +2307,6 @@ def check_active_signal(instrument, current_price, pv):
         if direction == "sell" and current_price <= tp1:
             ACTIVE_SIGNALS[instrument]["notified_tp1"] = True
             return {"status": "tp1_hit", "level": tp1, "label": signal["tp1_label"]}
-
-    # Near entry (within 8 pips for forex, $50 for BTC, $1 for gold)
-    if not signal["notified_entry"]:
-        near_threshold = pv * 8
-        if "BTC" in instrument:
-            near_threshold = 50
-        elif "XAU" in instrument:
-            near_threshold = 1.0
-
-        distance = abs(current_price - entry)
-        if distance <= near_threshold:
-            ACTIVE_SIGNALS[instrument]["notified_entry"] = True
-            return {"status": "near_entry", "entry": entry, "direction": direction}
 
     return {"status": "active"}
 
