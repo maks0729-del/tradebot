@@ -769,6 +769,16 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     result["has_setup"] = score >= 3
     result["origin_score"] = score  # save before boosts
 
+    # ── HTF ZONE CONFLUENCE ── (price currently IN 4H or 1H zone + OTE)
+    fib_h1_data = result.get("fibonacci_h1") or result.get("fibonacci") or {}
+    fib_h4_data = result.get("fibonacci") if "BTC" in instrument else {}
+    htf_zone = check_htf_zone_confluence(
+        result.get("current_price", 0),
+        result, fib_h1_data, fib_h4_data,
+        result.get("structure_H1", {}).get("trend", "")
+    )
+    result["htf_zone"] = htf_zone
+
     # ── SCORE БУСТЕРИ (максимум +2) ──
     boosts = 0
 
@@ -816,6 +826,15 @@ def analyze_smc(candles_by_tf, instrument="EUR_USD"):
     # Буст 5: Reversal на старшому TF (H4 або D) — сильніший сигнал
     if signal.get("type") == "reversal" and signal.get("sl_tf") in ("H4", "D"):
         boosts += 1
+
+    # Буст 7: Ціна ЗАРАЗ в HTF зоні (4H або 1H OB/FVG/BPR)
+    htf_zone = result.get("htf_zone") or {}
+    if htf_zone.get("in_zone"):
+        boosts += 1  # In HTF zone
+        if htf_zone.get("in_ote"):
+            boosts += htf_zone.get("ote_quality", 0)  # +1/+2/+3 based on OTE quality
+        if htf_zone.get("zone_tf") == "H4":
+            boosts += 1  # Extra boost for H4 zone
 
     # Застосовуємо бустери (максимум 5/5)
     result["setup_quality"] = min(result["setup_quality"] + boosts, 5)
@@ -1595,6 +1614,96 @@ def find_intermediate_fvg(smc_data, direction, entry_price, target_price):
 
     return intermediate[:3]  # max 3 intermediate zones
 
+
+def price_in_zone(price, zone_list, zone_type="ob"):
+    """Check if price is currently INSIDE an OB, FVG or BPR zone."""
+    for z in zone_list:
+        bottom = z.get("bottom", 0)
+        top = z.get("top", 0)
+        if bottom and top and bottom <= price <= top:
+            return True, z
+    return False, None
+
+
+def check_htf_zone_confluence(price, smc_data, fib_h1, fib_h4, trend):
+    """
+    Check if price is currently IN an HTF zone (4H or 1H OB/FVG/BPR)
+    and whether that zone is in OTE range.
+    Returns confidence level 0-4.
+    """
+    result = {
+        "in_zone": False,
+        "zone_tf": None,
+        "zone_type": None,
+        "in_ote": False,
+        "ote_quality": 0,  # 0=none, 1=0.5, 2=0.618, 3=0.705-0.786
+        "confidence": 0,
+    }
+
+    for tf, fib in [("H4", fib_h4), ("H1", fib_h1)]:
+        obs  = smc_data.get("ob_"  + tf, [])
+        fvgs = smc_data.get("fvg_" + tf, [])
+        bprs = smc_data.get("bpr_" + tf, [])
+
+        # Check OBs
+        in_ob, ob = price_in_zone(price, obs)
+        # Check FVGs
+        in_fvg, fvg = price_in_zone(price, fvgs)
+        # Check BPRs
+        in_bpr, bpr = price_in_zone(price, bprs)
+
+        if in_ob or in_fvg or in_bpr:
+            result["in_zone"] = True
+            result["zone_tf"] = tf
+            if in_bpr:
+                result["zone_type"] = "BPR"
+            elif in_fvg:
+                result["zone_type"] = "FVG"
+            else:
+                result["zone_type"] = "OB"
+                if ob and ob.get("body_confirmed"):
+                    result["zone_type"] = "OB★"
+
+            # Check OTE
+            if fib:
+                f50  = fib.get("fib_0_5", 0)
+                f618 = fib.get("fib_0_618", 0)
+                f705 = fib.get("fib_0_705", 0)
+                f79  = fib.get("fib_0_79", 0)
+
+                if trend == "bullish" and f79 and f50:
+                    if f705 <= price <= f79:
+                        result["in_ote"] = True
+                        result["ote_quality"] = 3  # Golden OTE
+                    elif f618 <= price <= f705:
+                        result["in_ote"] = True
+                        result["ote_quality"] = 2
+                    elif f50 <= price <= f618:
+                        result["in_ote"] = True
+                        result["ote_quality"] = 1
+                elif trend == "bearish" and f50 and f79:
+                    if f705 <= price <= f79:
+                        result["in_ote"] = True
+                        result["ote_quality"] = 3
+                    elif f618 <= price <= f705:
+                        result["in_ote"] = True
+                        result["ote_quality"] = 2
+                    elif f50 <= price <= f618:
+                        result["in_ote"] = True
+                        result["ote_quality"] = 1
+
+            # Confidence based on TF and OTE
+            conf = 1  # base: in zone
+            if tf == "H4":
+                conf += 1  # higher TF = more significant
+            if result["in_ote"]:
+                conf += result["ote_quality"]
+
+            result["confidence"] = min(conf, 4)
+            return result  # Return first match (H4 priority)
+
+    return result
+
 def calculate_setups(instrument, smc_data):
     price = smc_data.get("current_price", 0)
     key = smc_data.get("key_levels", {})
@@ -1623,7 +1732,14 @@ def calculate_setups(instrument, smc_data):
 
     # ── BUY SETUP ──
     fib = smc_data.get("fibonacci") or {}
-    buy_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "buy", fib)
+    # Merge H1 + H4 zones — H4 FVG/OB in OTE has priority
+    ob_h4 = smc_data.get("ob_H4", [])
+    fvg_h4 = smc_data.get("fvg_H4", [])
+    bpr_h4 = smc_data.get("bpr_H4", [])
+    ob_combined  = ob_h1 + ob_h4
+    fvg_combined = fvg_h1 + fvg_h4
+    bpr_combined = bpr_h1 + bpr_h4
+    buy_zone = find_entry_zone(ob_combined, fvg_combined, bpr_combined, price, "buy", fib)
 
     # Continuation BUY — override with correction zone below price
     if sc_scenario == "continuation" and sc_direction == "buy":
@@ -1775,7 +1891,7 @@ def calculate_setups(instrument, smc_data):
         }
 
     # ── SELL SETUP ──
-    sell_zone = find_entry_zone(ob_h1, fvg_h1, bpr_h1, price, "sell", fib)
+    sell_zone = find_entry_zone(ob_combined, fvg_combined, bpr_combined, price, "sell", fib)
 
     # Override: if continuation SELL — enter from correction zone above price
     if sc_scenario == "continuation" and sc_direction == "sell":
@@ -2059,7 +2175,14 @@ async def get_ai_analysis(instrument, smc_data, session_info, alert_mode=False):
         "1H: " + pd_str(smc_data.get("pd_zone_H1", {})) + "\n\n"
         "=== 5M ТРИГЕР ===\n"
         + smc_data.get("trigger_5m", {}).get("desc", "немає даних") + "\n\n"
-        "SCORE: " + str(smc_data.get("setup_quality", 0)) + "/5\n\n"
+        "SCORE: " + str(smc_data.get("setup_quality", 0)) + "/5\n" +
+        (lambda hz: (
+            "HTF ЗОНА: Ціна В " + hz.get("zone_type","") + " " + hz.get("zone_tf","") +
+            (" + OTE " + str(["","0.5","0.618","0.705-0.786"][hz.get("ote_quality",0)]) if hz.get("in_ote") else "") +
+            " (впевненість: " + str(hz.get("confidence",0)) + "/4)\n"
+            if hz.get("in_zone") else ""
+        ))(smc_data.get("htf_zone") or {}) +
+        "\n"
         "ПРАВИЛА: RR мін 1:2, ціль 1:3+, ризик 0.5-1%, prop challenge +8%\n\n"
         "=== РОЗРАХОВАНІ РІВНІ (використовуй ТІЛЬКИ ЦІ цифри!) ===\n"
         "BUY: " + format_setup(setups.get("buy"), "buy", instrument) + "\n"
